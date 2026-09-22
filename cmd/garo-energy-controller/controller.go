@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"sync"
 	"time"
 )
@@ -76,6 +77,85 @@ func (g *GaroClient) GetMeterInfo(name string) (GaroMeterInfo, error) {
 	return meter, nil
 }
 
+type GaroPilotLevel struct {
+	SerialNumber int `json:"serial_number"`
+	PilotA       int `json:"pilot_a"`
+}
+
+func (g *GaroClient) GetPilotLevels() ([]GaroPilotLevel, error) {
+	type pilotResponse struct {
+		SerialNumber int `json:"serialNumber"`
+		PilotLevel   int `json:"pilotLevel"`
+	}
+
+	levels := make(map[int]int)
+
+	resp, err := g.client.Get(g.baseURL + "/status")
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf(
+			"GET status: HTTP %d: %s",
+			resp.StatusCode,
+			string(body),
+		)
+	}
+
+	var master pilotResponse
+	if err := json.NewDecoder(resp.Body).Decode(&master); err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	resp.Body.Close()
+
+	if master.SerialNumber != 0 {
+		levels[master.SerialNumber] = master.PilotLevel
+	}
+
+	resp, err = g.client.Get(g.baseURL + "/slaves/false")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf(
+			"GET slaves/false: HTTP %d: %s",
+			resp.StatusCode,
+			string(body),
+		)
+	}
+
+	var slaves []pilotResponse
+	if err := json.NewDecoder(resp.Body).Decode(&slaves); err != nil {
+		return nil, err
+	}
+
+	for _, slave := range slaves {
+		if slave.SerialNumber != 0 {
+			levels[slave.SerialNumber] = slave.PilotLevel
+		}
+	}
+
+	result := make([]GaroPilotLevel, 0, len(levels))
+	for serial, pilot := range levels {
+		result = append(result, GaroPilotLevel{
+			SerialNumber: serial,
+			PilotA:       pilot,
+		})
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].SerialNumber > result[j].SerialNumber
+	})
+
+	return result, nil
+}
+
 func (g *GaroClient) GetLoadBalancingFuse() (int, error) {
 	cfg, err := g.GetLBConfig()
 	if err != nil {
@@ -100,6 +180,9 @@ type ControllerSnapshot struct {
 	EnergyValid bool   `json:"energy_valid"`
 	PhaseMode   string `json:"phase_mode,omitempty"`
 
+	PilotLevels []GaroPilotLevel `json:"pilot_levels,omitempty"`
+	PilotError  string           `json:"pilot_error,omitempty"`
+
 	HourEnergyKWh      float64 `json:"hour_energy_kwh"`
 	RemainingEnergyKWh float64 `json:"remaining_energy_kwh"`
 
@@ -112,6 +195,9 @@ type ControllerSnapshot struct {
 
 	DLMCurrentA  int     `json:"dlm_current_a"`
 	DLMHeadroomA float64 `json:"dlm_headroom_a"`
+
+	CalculatedRequiredIncreaseA float64 `json:"calculated_required_increase_a,omitempty"`
+	CalculatedDLMTargetA        int     `json:"calculated_dlm_target_a,omitempty"`
 
 	Central100Phase1A float64 `json:"central100_phase1_a"`
 	Central100Phase2A float64 `json:"central100_phase2_a"`
@@ -427,15 +513,29 @@ func calculatedUpStep(
 	headroomW float64,
 	wattsPerAmp float64,
 	reserveW float64,
+	unusedDLMHeadroomA float64,
 	maxStepA int,
-) int {
+) (stepA int, requiredIncreaseA float64) {
 	usableHeadroomW := headroomW - reserveW
 	if usableHeadroomW <= 0 || wattsPerAmp <= 0 {
-		return 1
+		return 0, 0
 	}
 
-	step := int(math.Floor(usableHeadroomW / wattsPerAmp))
-	return clampInt(step, 1, maxStepA)
+	// Convert the remaining power budget to the amount of additional charging
+	// current that would consume it. Existing unused DLM authority already
+	// contributes toward that requirement, so only add the difference.
+	requiredIncreaseA = usableHeadroomW / wattsPerAmp
+	if unusedDLMHeadroomA < 0 {
+		unusedDLMHeadroomA = 0
+	}
+
+	additionalDLMNeededA := requiredIncreaseA - unusedDLMHeadroomA
+	if additionalDLMNeededA <= 0 {
+		return 0, requiredIncreaseA
+	}
+
+	stepA = int(math.Ceil(additionalDLMNeededA))
+	return clampInt(stepA, 1, maxStepA), requiredIncreaseA
 }
 
 func populateMeterDiagnostics(
@@ -731,6 +831,9 @@ func (c *EnergyController) tick() {
 		}
 
 		unusedDLMHeadroomA := float64(currentLimit) - maxSiteCurrentA
+		if unusedDLMHeadroomA < 0 {
+			unusedDLMHeadroomA = 0
+		}
 		normalDwell := time.Duration(cfg.ControlTuning.NormalDwellSeconds) * time.Second
 
 		switch {
@@ -743,37 +846,53 @@ func (c *EnergyController) tick() {
 			)
 
 		case headroomW > calculatedThresholdW:
-			// Far below target: give GARO enough DLM ceiling for its own pilot
-			// ramp instead of feeding it one amp at a time. After an upward
-			// change, do not stack another calculated jump until GARO has used
-			// the outstanding allocation.
-			if c.lastAdjustmentDelta > 0 &&
-				unusedDLMHeadroomA > cfg.ControlTuning.UnusedDLMHeadroomA {
+			// Far below the energy target, calculate how much additional charging
+			// current the power budget can support. Existing unused DLM headroom is
+			// subtracted from that requirement, but it no longer blocks an increase
+			// by itself. This lets us raise the DLM ceiling while GARO is still
+			// slowly ramping the pilot, without blindly stacking the full max step.
+			step, requiredIncreaseA := calculatedUpStep(
+				headroomW,
+				wattsPerAmp,
+				cfg.ControlTuning.CalculatedReserveW,
+				unusedDLMHeadroomA,
+				maxCalculatedStepA,
+			)
+
+			s.CalculatedRequiredIncreaseA = requiredIncreaseA
+
+			desiredTarget := currentLimit + step
+			if desiredTarget > cfg.MaximumCurrentA {
+				desiredTarget = cfg.MaximumCurrentA
+			}
+			actualStep := desiredTarget - currentLimit
+			s.CalculatedDLMTargetA = desiredTarget
+
+			if actualStep <= 0 {
+				s.CalculatedDLMTargetA = currentLimit
 				s.Decision = fmt.Sprintf(
-					"hold calculated increase: GARO still has %.1f A unused DLM headroom",
+					"hold calculated increase: %.1f A DLM headroom already covers %.1f A calculated requirement",
 					unusedDLMHeadroomA,
+					requiredIncreaseA,
 				)
 			} else if adjustmentAge < normalDwell {
 				s.Decision = fmt.Sprintf(
-					"hold calculated increase: %.0f W headroom; waiting %ds/%ds",
-					headroomW,
+					"hold calculated target %d A: need +%d A after %.1f A existing DLM headroom; waiting %ds/%ds",
+					s.CalculatedDLMTargetA,
+					actualStep,
+					unusedDLMHeadroomA,
 					int(adjustmentAge.Seconds()),
 					int(normalDwell.Seconds()),
 				)
 			} else {
-				step = calculatedUpStep(
-					headroomW,
-					wattsPerAmp,
-					cfg.ControlTuning.CalculatedReserveW,
-					maxCalculatedStepA,
-				)
-				target = currentLimit + step
+				target = desiredTarget
 				s.Decision = fmt.Sprintf(
-					"calculated increase %d A: %.0f W headroom, %.0f W reserve, %.0f W/A (%s)",
-					step,
+					"calculated target %d A: %.0f W headroom -> %.1f A required, %.1f A already available, +%d A (%s)",
+					target,
 					headroomW,
-					cfg.ControlTuning.CalculatedReserveW,
-					wattsPerAmp,
+					requiredIncreaseA,
+					unusedDLMHeadroomA,
+					actualStep,
 					s.PhaseMode,
 				)
 			}

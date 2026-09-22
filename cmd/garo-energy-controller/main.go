@@ -399,6 +399,15 @@ func main() {
 
 		cfg := store.Get()
 
+		controllerStatus := controller.Snapshot()
+		if pilots, pilotErr := garo.GetPilotLevels(); pilotErr != nil {
+			controllerStatus.PilotLevels = nil
+			controllerStatus.PilotError = pilotErr.Error()
+		} else {
+			controllerStatus.PilotLevels = pilots
+			controllerStatus.PilotError = ""
+		}
+
 		status := Status{
 
 			Enabled: cfg.Enabled,
@@ -409,7 +418,7 @@ func main() {
 
 			Tibber: tibber.Snapshot(),
 
-			Controller: controller.Snapshot(),
+			Controller: controllerStatus,
 		}
 
 		lbCfg, err := garo.GetLBConfig()
@@ -762,6 +771,8 @@ button:hover { background: #eee; }
                 <div class="data-line"><span class="data-label">Mode:</span> <span id="controllerStatus">...</span></div>
                 <div class="data-line"><span class="data-label">Charging:</span> <span id="charging">...</span></div>
                 <div class="data-line"><span class="data-label">Phase mode:</span> <span id="phaseMode">...</span></div>
+                <div class="data-line"><span class="data-label">Pilot currents:</span> <span id="pilotCurrents">...</span></div>
+                <div class="data-line"><span class="data-label">Calculated DLM target:</span> <span id="calculatedDlmTarget">...</span></div>
                 <div class="data-line"><span class="data-label">Decision:</span> <span id="decision">...</span></div>
             </div>
         </div>
@@ -942,6 +953,14 @@ function formatPhaseCurrents(c, prefix) {
     return p1.toFixed(1) + " / " + p2.toFixed(1) + " / " + p3.toFixed(1) + " A";
 }
 
+function formatPilotCurrents(c) {
+    const pilots = c.pilot_levels || [];
+    if (pilots.length === 0) {
+        return c.pilot_error ? "Unavailable" : "-";
+    }
+    return pilots.map(p => p.serial_number + ": " + p.pilot_a + " A").join(" / ");
+}
+
 async function refreshStatus() {
     try {
         const r = await fetch("/api/status", {cache: "no-store"});
@@ -955,6 +974,8 @@ async function refreshStatus() {
         setText("controllerStatus", s.enabled ? s.mode : "Disabled");
         setText("charging", c.charging ? "Yes" : "No");
         setText("phaseMode", c.phase_mode || "-");
+        setText("pilotCurrents", formatPilotCurrents(c));
+        setText("calculatedDlmTarget", c.calculated_dlm_target_a ? c.calculated_dlm_target_a + " A" : "-");
         setText("decision", c.decision || "-");
         setText("central100Current", formatPhaseCurrents(c, "central100"));
         setText("central101Current", formatPhaseCurrents(c, "central101"));
