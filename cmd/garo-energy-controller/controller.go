@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,6 +18,9 @@ const (
 	// Conservative fallback estimate. CENTRAL100 measures total site
 	// consumption, not net grid import.
 	fallbackVoltage = 230.0
+
+	garoStaleAfter       = 60 * time.Second
+	garoFastPollInterval = 5 * time.Second
 )
 
 type GaroMeterInfo struct {
@@ -49,6 +53,9 @@ func (m GaroMeterInfo) ConservativePowerW() float64 {
 }
 
 func (g *GaroClient) GetMeterInfo(name string) (GaroMeterInfo, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
 	var meter GaroMeterInfo
 
 	resp, err := g.client.Get(
@@ -83,6 +90,9 @@ type GaroPilotLevel struct {
 }
 
 func (g *GaroClient) GetPilotLevels() ([]GaroPilotLevel, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
 	type pilotResponse struct {
 		SerialNumber int `json:"serialNumber"`
 		PilotLevel   int `json:"pilotLevel"`
@@ -156,6 +166,303 @@ func (g *GaroClient) GetPilotLevels() ([]GaroPilotLevel, error) {
 	return result, nil
 }
 
+type GaroCache struct {
+	mu sync.RWMutex
+
+	central100      GaroMeterInfo
+	central100Valid bool
+	central100At    time.Time
+	central100Error string
+
+	central101      GaroMeterInfo
+	central101Valid bool
+	central101At    time.Time
+	central101Error string
+
+	loadBalancingFuse    int
+	loadBalancingFuse101 int
+	lbValid              bool
+	lbAt                 time.Time
+	lbError              string
+
+	pilotLevels []GaroPilotLevel
+	pilotValid  bool
+	pilotAt     time.Time
+	pilotError  string
+}
+
+type GaroMeterRefreshResult struct {
+	Central100OK bool
+	Central101OK bool
+}
+
+type GaroCacheSnapshot struct {
+	Central100           GaroMeterInfo
+	Central100Valid      bool
+	Central100AgeSeconds int64
+	Central100Stale      bool
+	Central100Error      string
+
+	Central101           GaroMeterInfo
+	Central101Valid      bool
+	Central101AgeSeconds int64
+	Central101Stale      bool
+	Central101Error      string
+
+	LoadBalancingFuse    int
+	LoadBalancingFuse101 int
+	LBValid              bool
+	LBAgeSeconds         int64
+	LBStale              bool
+	LBError              string
+
+	PilotLevels     []GaroPilotLevel
+	PilotValid      bool
+	PilotAgeSeconds int64
+	PilotStale      bool
+	PilotError      string
+
+	Online bool
+}
+
+func NewGaroCache() *GaroCache {
+	return &GaroCache{}
+}
+
+func sourceAge(now, updated time.Time) (int64, bool) {
+	if updated.IsZero() {
+		return 0, false
+	}
+
+	age := now.Sub(updated)
+	if age < 0 {
+		age = 0
+	}
+
+	return int64(age.Seconds()), age > garoStaleAfter
+}
+
+func (c *GaroCache) Snapshot(now time.Time) GaroCacheSnapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	s := GaroCacheSnapshot{
+		Central100:           c.central100,
+		Central100Valid:      c.central100Valid,
+		Central100Error:      c.central100Error,
+		Central101:           c.central101,
+		Central101Valid:      c.central101Valid,
+		Central101Error:      c.central101Error,
+		LoadBalancingFuse:    c.loadBalancingFuse,
+		LoadBalancingFuse101: c.loadBalancingFuse101,
+		LBValid:              c.lbValid,
+		LBError:              c.lbError,
+		PilotValid:           c.pilotValid,
+		PilotError:           c.pilotError,
+	}
+
+	s.PilotLevels = append([]GaroPilotLevel(nil), c.pilotLevels...)
+
+	if c.central100Valid {
+		s.Central100AgeSeconds, s.Central100Stale = sourceAge(now, c.central100At)
+	}
+	if c.central101Valid {
+		s.Central101AgeSeconds, s.Central101Stale = sourceAge(now, c.central101At)
+	}
+	if c.lbValid {
+		s.LBAgeSeconds, s.LBStale = sourceAge(now, c.lbAt)
+	}
+	if c.pilotValid {
+		s.PilotAgeSeconds, s.PilotStale = sourceAge(now, c.pilotAt)
+	}
+
+	s.Online =
+		(c.central100Valid && !s.Central100Stale) ||
+			(c.central101Valid && !s.Central101Stale) ||
+			(c.lbValid && !s.LBStale) ||
+			(c.pilotValid && !s.PilotStale)
+
+	return s
+}
+
+func (c *GaroCache) RefreshMeters(g *GaroClient) GaroMeterRefreshResult {
+	now := time.Now()
+	result := GaroMeterRefreshResult{}
+
+	central100, err := g.GetMeterInfo("CENTRAL100")
+	c.mu.Lock()
+	if err != nil {
+		c.central100Error = err.Error()
+	} else {
+		c.central100 = central100
+		c.central100Valid = true
+		c.central100At = now
+		c.central100Error = ""
+		result.Central100OK = true
+	}
+	c.mu.Unlock()
+
+	central101, err := g.GetMeterInfo("CENTRAL101")
+	c.mu.Lock()
+	if err != nil {
+		c.central101Error = err.Error()
+	} else {
+		c.central101 = central101
+		c.central101Valid = true
+		c.central101At = time.Now()
+		c.central101Error = ""
+		result.Central101OK = true
+	}
+	c.mu.Unlock()
+
+	return result
+}
+
+func (c *GaroCache) RefreshFast(g *GaroClient) {
+	pilots, err := g.GetPilotLevels()
+	c.mu.Lock()
+	if err != nil {
+		c.pilotError = err.Error()
+	} else {
+		c.pilotLevels = append(c.pilotLevels[:0], pilots...)
+		c.pilotValid = true
+		c.pilotAt = time.Now()
+		c.pilotError = ""
+	}
+	c.mu.Unlock()
+
+	lbCfg, err := g.GetLBConfig()
+	if err != nil {
+		c.mu.Lock()
+		c.lbError = err.Error()
+		c.mu.Unlock()
+		return
+	}
+
+	fuse100 := rawInt(lbCfg["loadBalancingFuse"])
+	fuse101 := rawInt(lbCfg["loadBalancingFuse101"])
+	if fuse100 == nil || fuse101 == nil {
+		c.mu.Lock()
+		c.lbError = "load-balancing fuse values missing from GARO configuration"
+		c.mu.Unlock()
+		return
+	}
+
+	c.mu.Lock()
+	c.loadBalancingFuse = *fuse100
+	c.loadBalancingFuse101 = *fuse101
+	c.lbValid = true
+	c.lbAt = time.Now()
+	c.lbError = ""
+	c.mu.Unlock()
+}
+
+func (c *GaroCache) RunFast(ctx context.Context, g *GaroClient) {
+	ticker := time.NewTicker(garoFastPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.RefreshFast(g)
+		}
+	}
+}
+
+func (c *GaroCache) NoteLoadBalancingFuse(currentA int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.loadBalancingFuse = currentA
+	if c.lbValid {
+		c.lbAt = time.Now()
+		c.lbError = ""
+	}
+}
+
+func garoErrorSummary(s GaroCacheSnapshot) string {
+	parts := make([]string, 0, 4)
+	if s.Central100Error != "" {
+		parts = append(parts, "CENTRAL100: "+s.Central100Error)
+	}
+	if s.Central101Error != "" {
+		parts = append(parts, "CENTRAL101: "+s.Central101Error)
+	}
+	if s.LBError != "" {
+		parts = append(parts, "load balancing: "+s.LBError)
+	}
+	if s.PilotError != "" {
+		parts = append(parts, "pilot status: "+s.PilotError)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func controlRefreshProblem(refresh GaroMeterRefreshResult, s GaroCacheSnapshot) string {
+	parts := make([]string, 0, 3)
+	if !refresh.Central100OK {
+		parts = append(parts, "CENTRAL100 refresh failed")
+	}
+	if !refresh.Central101OK {
+		parts = append(parts, "CENTRAL101 refresh failed")
+	}
+	if !s.LBValid {
+		parts = append(parts, "DLM configuration unavailable")
+	} else if s.LBError != "" {
+		parts = append(parts, "DLM configuration refresh failed")
+	} else if s.LBStale {
+		parts = append(parts, "DLM configuration stale")
+	}
+	return strings.Join(parts, ", ")
+}
+
+func mergeGaroDiagnostics(s *ControllerSnapshot, g GaroCacheSnapshot) {
+	s.Central100Valid = g.Central100Valid
+	s.Central100AgeSeconds = g.Central100AgeSeconds
+	s.Central100Stale = g.Central100Stale
+	s.Central100Error = g.Central100Error
+	if g.Central100Valid {
+		a, b, d := g.Central100.CurrentsA()
+		s.Central100Phase1A = a
+		s.Central100Phase2A = b
+		s.Central100Phase3A = d
+	}
+
+	s.Central101Valid = g.Central101Valid
+	s.Central101AgeSeconds = g.Central101AgeSeconds
+	s.Central101Stale = g.Central101Stale
+	s.Central101Error = g.Central101Error
+	if g.Central101Valid {
+		a, b, d := g.Central101.CurrentsA()
+		s.Central101Phase1A = a
+		s.Central101Phase2A = b
+		s.Central101Phase3A = d
+		s.Charging = g.Central101.MaxCurrentA() >= chargingThresholdA
+		s.PhaseMode = phaseMode(g.Central101)
+	}
+
+	s.DLMConfigValid = g.LBValid
+	s.DLMConfigAgeSeconds = g.LBAgeSeconds
+	s.DLMConfigStale = g.LBStale
+	s.DLMConfigError = g.LBError
+	if g.LBValid {
+		s.DLMCurrentA = g.LoadBalancingFuse
+	}
+
+	if g.LBValid && g.Central100Valid {
+		s.DLMHeadroomA = float64(g.LoadBalancingFuse) - g.Central100.MaxCurrentA()
+	}
+
+	s.PilotValid = g.PilotValid
+	s.PilotAgeSeconds = g.PilotAgeSeconds
+	s.PilotStale = g.PilotStale
+	s.PilotError = g.PilotError
+	if g.PilotValid {
+		s.PilotLevels = append([]GaroPilotLevel(nil), g.PilotLevels...)
+	}
+}
+
 func (g *GaroClient) GetLoadBalancingFuse() (int, error) {
 	cfg, err := g.GetLBConfig()
 	if err != nil {
@@ -180,8 +487,11 @@ type ControllerSnapshot struct {
 	EnergyValid bool   `json:"energy_valid"`
 	PhaseMode   string `json:"phase_mode,omitempty"`
 
-	PilotLevels []GaroPilotLevel `json:"pilot_levels,omitempty"`
-	PilotError  string           `json:"pilot_error,omitempty"`
+	PilotLevels     []GaroPilotLevel `json:"pilot_levels,omitempty"`
+	PilotValid      bool             `json:"pilot_valid"`
+	PilotAgeSeconds int64            `json:"pilot_age_seconds,omitempty"`
+	PilotStale      bool             `json:"pilot_stale"`
+	PilotError      string           `json:"pilot_error,omitempty"`
 
 	HourEnergyKWh      float64 `json:"hour_energy_kwh"`
 	RemainingEnergyKWh float64 `json:"remaining_energy_kwh"`
@@ -193,19 +503,31 @@ type ControllerSnapshot struct {
 	SecondsRemaining int    `json:"seconds_remaining"`
 	ReferenceTime    string `json:"reference_time,omitempty"`
 
-	DLMCurrentA  int     `json:"dlm_current_a"`
-	DLMHeadroomA float64 `json:"dlm_headroom_a"`
+	DLMCurrentA         int     `json:"dlm_current_a"`
+	DLMHeadroomA        float64 `json:"dlm_headroom_a"`
+	DLMConfigValid      bool    `json:"dlm_config_valid"`
+	DLMConfigAgeSeconds int64   `json:"dlm_config_age_seconds,omitempty"`
+	DLMConfigStale      bool    `json:"dlm_config_stale"`
+	DLMConfigError      string  `json:"dlm_config_error,omitempty"`
 
 	CalculatedRequiredIncreaseA float64 `json:"calculated_required_increase_a,omitempty"`
 	CalculatedDLMTargetA        int     `json:"calculated_dlm_target_a,omitempty"`
 
-	Central100Phase1A float64 `json:"central100_phase1_a"`
-	Central100Phase2A float64 `json:"central100_phase2_a"`
-	Central100Phase3A float64 `json:"central100_phase3_a"`
+	Central100Phase1A    float64 `json:"central100_phase1_a"`
+	Central100Phase2A    float64 `json:"central100_phase2_a"`
+	Central100Phase3A    float64 `json:"central100_phase3_a"`
+	Central100Valid      bool    `json:"central100_valid"`
+	Central100AgeSeconds int64   `json:"central100_age_seconds,omitempty"`
+	Central100Stale      bool    `json:"central100_stale"`
+	Central100Error      string  `json:"central100_error,omitempty"`
 
-	Central101Phase1A float64 `json:"central101_phase1_a"`
-	Central101Phase2A float64 `json:"central101_phase2_a"`
-	Central101Phase3A float64 `json:"central101_phase3_a"`
+	Central101Phase1A    float64 `json:"central101_phase1_a"`
+	Central101Phase2A    float64 `json:"central101_phase2_a"`
+	Central101Phase3A    float64 `json:"central101_phase3_a"`
+	Central101Valid      bool    `json:"central101_valid"`
+	Central101AgeSeconds int64   `json:"central101_age_seconds,omitempty"`
+	Central101Stale      bool    `json:"central101_stale"`
+	Central101Error      string  `json:"central101_error,omitempty"`
 
 	LastAdjustmentAgeSeconds int64 `json:"last_adjustment_age_seconds"`
 
@@ -216,6 +538,7 @@ type ControllerSnapshot struct {
 
 type EnergyController struct {
 	garo      *GaroClient
+	garoCache *GaroCache
 	tibber    *TibberClient
 	getConfig func() Config
 
@@ -237,11 +560,13 @@ type EnergyController struct {
 
 func NewEnergyController(
 	garo *GaroClient,
+	garoCache *GaroCache,
 	tibber *TibberClient,
 	getConfig func() Config,
 ) *EnergyController {
 	return &EnergyController{
 		garo:      garo,
+		garoCache: garoCache,
 		tibber:    tibber,
 		getConfig: getConfig,
 	}
@@ -251,7 +576,9 @@ func (c *EnergyController) Snapshot() ControllerSnapshot {
 	c.snapshotMu.RLock()
 	defer c.snapshotMu.RUnlock()
 
-	return c.snapshot
+	s := c.snapshot
+	s.PilotLevels = append([]GaroPilotLevel(nil), c.snapshot.PilotLevels...)
+	return s
 }
 
 func (c *EnergyController) setSnapshot(s ControllerSnapshot) {
@@ -288,7 +615,12 @@ func (c *EnergyController) ensureCurrent(
 		return nil
 	}
 
-	return c.garo.SetLoadBalancingFuse(wanted)
+	if err := c.garo.SetLoadBalancingFuse(wanted); err != nil {
+		return err
+	}
+
+	c.garoCache.NoteLoadBalancingFuse(wanted)
+	return nil
 }
 
 func tibberReferenceTime(t TibberSnapshot) (time.Time, bool) {
@@ -316,6 +648,7 @@ func (c *EnergyController) getEnergySource(
 	now time.Time,
 	cfg Config,
 	central100 GaroMeterInfo,
+	central100Fresh bool,
 ) (
 	source string,
 	energyKWh float64,
@@ -353,6 +686,12 @@ func (c *EnergyController) getEnergySource(
 			powerW,
 			referenceTime,
 			true
+	}
+
+	// CENTRAL100 fallback is only advanced from a value refreshed in this
+	// control cycle. Cached/stale current remains available for display only.
+	if !central100Fresh {
+		return "none", 0, 0, time.Time{}, false
 	}
 
 	if !c.fallbackValid {
@@ -538,31 +877,6 @@ func calculatedUpStep(
 	return clampInt(stepA, 1, maxStepA), requiredIncreaseA
 }
 
-func populateMeterDiagnostics(
-	s *ControllerSnapshot,
-	central100 GaroMeterInfo,
-	central101 GaroMeterInfo,
-	currentLimit int,
-) {
-	c100a, c100b, c100c := central100.CurrentsA()
-	c101a, c101b, c101c := central101.CurrentsA()
-
-	s.Central100Phase1A = c100a
-	s.Central100Phase2A = c100b
-	s.Central100Phase3A = c100c
-
-	s.Central101Phase1A = c101a
-	s.Central101Phase2A = c101b
-	s.Central101Phase3A = c101c
-
-	s.DLMCurrentA = currentLimit
-	s.DLMHeadroomA =
-		float64(currentLimit) - central100.MaxCurrentA()
-
-	s.Charging = central101.MaxCurrentA() >= chargingThresholdA
-	s.PhaseMode = phaseMode(central101)
-}
-
 func populateEnergyDiagnostics(
 	s *ControllerSnapshot,
 	cfg Config,
@@ -610,52 +924,29 @@ func (c *EnergyController) tick() {
 	now := time.Now()
 	cfg := c.getConfig()
 
-	s := ControllerSnapshot{
-		LastRun: now.Format(time.RFC3339),
-		State:   "idle",
-		Source:  "none",
-	}
+	// Start with the previous snapshot so transient GARO failures do not erase
+	// last-known-good values. Freshness flags below determine whether they may
+	// be used for control.
+	s := c.Snapshot()
+	s.LastRun = now.Format(time.RFC3339)
+	s.State = "idle"
+	s.Decision = ""
+	s.Error = ""
+	s.CalculatedRequiredIncreaseA = 0
+	s.CalculatedDLMTargetA = 0
 
 	age := c.adjustmentAge(now)
 	if age < 365*24*time.Hour {
 		s.LastAdjustmentAgeSeconds = int64(age.Seconds())
 	}
 
-	// Read GARO regardless of controller mode so the status page remains
-	// useful in disabled, safe and manual modes.
-	central100, err := c.garo.GetMeterInfo("CENTRAL100")
-	if err != nil {
-		s.State = "error"
-		s.Error = err.Error()
-		s.Decision = "could not read CENTRAL100"
-		c.setSnapshot(s)
-		return
-	}
+	refresh := c.garoCache.RefreshMeters(c.garo)
+	garoState := c.garoCache.Snapshot(now)
+	mergeGaroDiagnostics(&s, garoState)
+	s.Error = garoErrorSummary(garoState)
 
-	central101, err := c.garo.GetMeterInfo("CENTRAL101")
-	if err != nil {
-		s.State = "error"
-		s.Error = err.Error()
-		s.Decision = "could not read CENTRAL101"
-		c.setSnapshot(s)
-		return
-	}
-
-	currentLimit, err := c.garo.GetLoadBalancingFuse()
-	if err != nil {
-		s.State = "error"
-		s.Error = err.Error()
-		s.Decision = "could not read DLM current limit"
-		c.setSnapshot(s)
-		return
-	}
-
-	populateMeterDiagnostics(
-		&s,
-		central100,
-		central101,
-		currentLimit,
-	)
+	central100 := garoState.Central100
+	currentLimit := garoState.LoadBalancingFuse
 
 	source,
 		hourEnergy,
@@ -665,6 +956,7 @@ func (c *EnergyController) tick() {
 		now,
 		cfg,
 		central100,
+		refresh.Central100OK,
 	)
 
 	populateEnergyDiagnostics(
@@ -687,6 +979,13 @@ func (c *EnergyController) tick() {
 	if cfg.Mode != "automatic" {
 		s.State = cfg.Mode
 		s.Decision = "automatic controller not active"
+		c.setSnapshot(s)
+		return
+	}
+
+	if problem := controlRefreshProblem(refresh, garoState); problem != "" {
+		s.State = "automatic-hold"
+		s.Decision = "hold: " + problem + "; retaining last GARO values"
 		c.setSnapshot(s)
 		return
 	}
@@ -948,7 +1247,7 @@ func (c *EnergyController) tick() {
 		return
 	}
 
-	if err := c.garo.SetLoadBalancingFuse(target); err != nil {
+	if err := c.ensureCurrent(currentLimit, target); err != nil {
 		s.Error = err.Error()
 		s.Decision += "; GARO update failed"
 		c.setSnapshot(s)

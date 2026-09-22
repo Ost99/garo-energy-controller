@@ -122,8 +122,13 @@ func (g *GaroClient) SetLoadBalancingFuse(currentA int) error {
 
 	}
 
-	// Modify only CENTRAL100.
+	// The GARO servlet updates Derby client-box rows whenever a slaves array is
+	// included in the POST. The charger accepts the same top-level load-balancing
+	// configuration without that array, avoiding persistent SD-card writes for
+	// ordinary DLM100 adjustments.
+	delete(cfg, "slaves")
 
+	// Modify only CENTRAL100.
 	cfg["loadBalancingFuse"] = json.RawMessage(strconv.Itoa(currentA))
 
 	payload, err := json.Marshal(cfg)
@@ -362,6 +367,12 @@ func main() {
 
 	}
 
+	garoCache := NewGaroCache()
+	// Prime in-memory values before the controller starts. Browser status
+	// requests read this cache and never call the GARO API directly.
+	garoCache.RefreshFast(garo)
+	go garoCache.RunFast(context.Background(), garo)
+
 	tibber := NewTibberClient(secrets.TibberToken)
 
 	go tibber.Run(
@@ -374,6 +385,8 @@ func main() {
 	controller := NewEnergyController(
 
 		garo,
+
+		garoCache,
 
 		tibber,
 
@@ -396,55 +409,33 @@ func main() {
 	}
 
 	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
-
 		cfg := store.Get()
-
+		garoState := garoCache.Snapshot(time.Now())
 		controllerStatus := controller.Snapshot()
-		if pilots, pilotErr := garo.GetPilotLevels(); pilotErr != nil {
-			controllerStatus.PilotLevels = nil
-			controllerStatus.PilotError = pilotErr.Error()
-		} else {
-			controllerStatus.PilotLevels = pilots
-			controllerStatus.PilotError = ""
-		}
+		mergeGaroDiagnostics(&controllerStatus, garoState)
 
 		status := Status{
-
-			Enabled: cfg.Enabled,
-
-			Mode: cfg.Mode,
-
+			GAROOnline:   garoState.Online,
+			Enabled:      cfg.Enabled,
+			Mode:         cfg.Mode,
 			SafeCurrentA: cfg.SafeCurrentA,
-
-			Tibber: tibber.Snapshot(),
-
-			Controller: controllerStatus,
+			Tibber:       tibber.Snapshot(),
+			Controller:   controllerStatus,
 		}
 
-		lbCfg, err := garo.GetLBConfig()
-
-		if err != nil {
-
-			status.Error = err.Error()
-
-			writeJSON(w, status)
-
-			return
-
+		if garoState.LBValid {
+			fuse100 := garoState.LoadBalancingFuse
+			fuse101 := garoState.LoadBalancingFuse101
+			status.LoadBalancingFuse = &fuse100
+			status.LoadBalancingFuse101 = &fuse101
 		}
 
-		status.GAROOnline = true
-
-		status.LoadBalancingFuse =
-
-			rawInt(lbCfg["loadBalancingFuse"])
-
-		status.LoadBalancingFuse101 =
-
-			rawInt(lbCfg["loadBalancingFuse101"])
+		status.Error = garoErrorSummary(garoState)
+		if controllerStatus.Error != "" && status.Error == "" {
+			status.Error = controllerStatus.Error
+		}
 
 		writeJSON(w, status)
-
 	})
 
 	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
@@ -943,22 +934,28 @@ function setText(id, value) {
     document.getElementById(id).textContent = value;
 }
 
+function staleSuffix(stale) {
+    return stale ? " (stale)" : "";
+}
+
 function formatPhaseCurrents(c, prefix) {
+    if (!c[prefix + "_valid"]) {
+        return "-";
+    }
     const p1 = c[prefix + "_phase1_a"];
     const p2 = c[prefix + "_phase2_a"];
     const p3 = c[prefix + "_phase3_a"];
-    if (p1 === undefined || p2 === undefined || p3 === undefined) {
-        return "-";
-    }
-    return p1.toFixed(1) + " / " + p2.toFixed(1) + " / " + p3.toFixed(1) + " A";
+    return p1.toFixed(1) + " / " + p2.toFixed(1) + " / " + p3.toFixed(1) + " A" +
+        staleSuffix(c[prefix + "_stale"]);
 }
 
 function formatPilotCurrents(c) {
     const pilots = c.pilot_levels || [];
-    if (pilots.length === 0) {
-        return c.pilot_error ? "Unavailable" : "-";
+    if (!c.pilot_valid || pilots.length === 0) {
+        return "-";
     }
-    return pilots.map(p => p.serial_number + ": " + p.pilot_a + " A").join(" / ");
+    return pilots.map(p => p.serial_number + ": " + p.pilot_a + " A").join(" / ") +
+        staleSuffix(c.pilot_stale);
 }
 
 async function refreshStatus() {
@@ -969,17 +966,17 @@ async function refreshStatus() {
         const c = s.controller || {};
 
         setText("garo", s.garo_online ? "Online" : "Offline");
-        setText("fuse100", s.load_balancing_fuse !== undefined ? s.load_balancing_fuse + " A" : "-");
-        setText("fuse101", s.load_balancing_fuse_101 !== undefined ? s.load_balancing_fuse_101 + " A" : "-");
+        setText("fuse100", s.load_balancing_fuse !== undefined ? s.load_balancing_fuse + " A" + staleSuffix(c.dlm_config_stale) : "-");
+        setText("fuse101", s.load_balancing_fuse_101 !== undefined ? s.load_balancing_fuse_101 + " A" + staleSuffix(c.dlm_config_stale) : "-");
         setText("controllerStatus", s.enabled ? s.mode : "Disabled");
-        setText("charging", c.charging ? "Yes" : "No");
-        setText("phaseMode", c.phase_mode || "-");
+        setText("charging", c.central101_valid ? (c.charging ? "Yes" : "No") + staleSuffix(c.central101_stale) : "-");
+        setText("phaseMode", c.central101_valid ? (c.phase_mode || "-") + staleSuffix(c.central101_stale) : "-");
         setText("pilotCurrents", formatPilotCurrents(c));
         setText("calculatedDlmTarget", c.calculated_dlm_target_a ? c.calculated_dlm_target_a + " A" : "-");
         setText("decision", c.decision || "-");
         setText("central100Current", formatPhaseCurrents(c, "central100"));
         setText("central101Current", formatPhaseCurrents(c, "central101"));
-        setText("dlmHeadroom", c.dlm_headroom_a !== undefined ? c.dlm_headroom_a.toFixed(1) + " A" : "-");
+        setText("dlmHeadroom", c.central100_valid && c.dlm_config_valid ? c.dlm_headroom_a.toFixed(1) + " A" + staleSuffix(c.central100_stale || c.dlm_config_stale) : "-");
         setText("lastAdjustment", c.last_adjustment_age_seconds !== undefined ? c.last_adjustment_age_seconds + " s ago" : "-");
         setText("powerHeadroom", c.energy_valid ? Math.round(c.power_headroom_w) + " W" : "-");
         setText("controlSource", c.source || "-");
@@ -998,7 +995,8 @@ async function refreshStatus() {
         setText("tibberApiResult", t.last_api_result || "-");
 
         const modeText = s.enabled ? s.mode.charAt(0).toUpperCase() + s.mode.slice(1) : "Disabled";
-        setText("topStatus", modeText + (c.charging ? " - Charging" : " - Not charging"));
+        const chargeText = c.central101_valid ? (c.charging ? " - Charging" : " - Not charging") + staleSuffix(c.central101_stale) : " - Charge state unavailable";
+        setText("topStatus", modeText + chargeText);
 
         if (t.error) {
             setText("error", "Tibber: " + t.error);
