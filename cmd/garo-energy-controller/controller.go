@@ -13,11 +13,26 @@ import (
 const (
 	chargingThresholdA = 2.0
 
-	controlDownDeadbandW = 300.0
-	controlUpDeadbandW   = 1000.0
+	// Power-control bands. Grid power is compared with the average power
+	// that can still be imported without exceeding the configured hourly
+	// energy limit.
+	controlDownDeadbandW   = 300.0
+	controlUrgentDownW     = 1500.0
+	controlFastUpW         = 4000.0
+	controlMidUpW          = 2500.0
+	controlNearUpW         = 1000.0
+	controlOnePhaseUpGateW = 400.0
+	controlMultiPhaseGateW = 800.0
 
-	// Conservative fallback estimate.
-	// CENTRAL100 measures total site consumption, not grid import.
+	// GARO reacts more slowly than our 30 s sampling loop. Do not stack
+	// normal changes while the previous one is still propagating.
+	controlNormalDwell  = 60 * time.Second
+	controlMidUpDwell   = 90 * time.Second
+	controlNearUpDwell  = 120 * time.Second
+	garoUnusedHeadroomA = 1.0
+
+	// Conservative fallback estimate. CENTRAL100 measures total site
+	// consumption, not net grid import.
 	fallbackVoltage = 230.0
 )
 
@@ -99,7 +114,22 @@ type ControllerSnapshot struct {
 	State  string `json:"state"`
 	Source string `json:"source"`
 
-	Charging bool `json:"charging"`
+	Charging    bool   `json:"charging"`
+	EnergyValid bool   `json:"energy_valid"`
+	PhaseMode   string `json:"phase_mode,omitempty"`
+
+	HourEnergyKWh      float64 `json:"hour_energy_kwh"`
+	RemainingEnergyKWh float64 `json:"remaining_energy_kwh"`
+
+	GridPowerW           float64 `json:"grid_power_w"`
+	AllowedAveragePowerW float64 `json:"allowed_average_power_w"`
+	PowerHeadroomW       float64 `json:"power_headroom_w"`
+
+	SecondsRemaining int    `json:"seconds_remaining"`
+	ReferenceTime    string `json:"reference_time,omitempty"`
+
+	DLMCurrentA  int     `json:"dlm_current_a"`
+	DLMHeadroomA float64 `json:"dlm_headroom_a"`
 
 	Central100Phase1A float64 `json:"central100_phase1_a"`
 	Central100Phase2A float64 `json:"central100_phase2_a"`
@@ -109,17 +139,7 @@ type ControllerSnapshot struct {
 	Central101Phase2A float64 `json:"central101_phase2_a"`
 	Central101Phase3A float64 `json:"central101_phase3_a"`
 
-	EnergyValid bool `json:"energy_valid"`
-
-	HourEnergyKWh      float64 `json:"hour_energy_kwh"`
-	RemainingEnergyKWh float64 `json:"remaining_energy_kwh"`
-
-	GridPowerW           float64 `json:"grid_power_w"`
-	AllowedAveragePowerW float64 `json:"allowed_average_power_w"`
-
-	SecondsRemaining int `json:"seconds_remaining"`
-
-	DLMCurrentA int `json:"dlm_current_a"`
+	LastAdjustmentAgeSeconds int64 `json:"last_adjustment_age_seconds"`
 
 	Decision string `json:"decision,omitempty"`
 	LastRun  string `json:"last_run,omitempty"`
@@ -137,10 +157,14 @@ type EnergyController struct {
 	idleSince   time.Time
 	safeApplied bool
 
-	fallbackValid     bool
-	fallbackHour      time.Time
-	fallbackEnergyKWh float64
-	fallbackLast      time.Time
+	lastAdjustment      time.Time
+	lastAdjustmentDelta int
+
+	fallbackValid         bool
+	fallbackHour          time.Time
+	fallbackEnergyKWh     float64
+	fallbackLast          time.Time
+	fallbackReferenceTime time.Time
 }
 
 func NewEnergyController(
@@ -148,7 +172,6 @@ func NewEnergyController(
 	tibber *TibberClient,
 	getConfig func() Config,
 ) *EnergyController {
-
 	return &EnergyController{
 		garo:      garo,
 		tibber:    tibber,
@@ -193,12 +216,32 @@ func (c *EnergyController) ensureCurrent(
 	current int,
 	wanted int,
 ) error {
-
 	if current == wanted {
 		return nil
 	}
 
 	return c.garo.SetLoadBalancingFuse(wanted)
+}
+
+func tibberReferenceTime(t TibberSnapshot) (time.Time, bool) {
+	if t.MeasurementTimestamp == "" {
+		return time.Time{}, false
+	}
+
+	ts, err := time.Parse(time.RFC3339Nano, t.MeasurementTimestamp)
+	if err != nil {
+		ts, err = time.Parse(time.RFC3339, t.MeasurementTimestamp)
+		if err != nil {
+			return time.Time{}, false
+		}
+	}
+
+	age := t.AgeSeconds
+	if age < 0 {
+		age = 0
+	}
+
+	return ts.Add(time.Duration(age) * time.Second), true
 }
 
 func (c *EnergyController) getEnergySource(
@@ -209,9 +252,9 @@ func (c *EnergyController) getEnergySource(
 	source string,
 	energyKWh float64,
 	powerW float64,
+	referenceTime time.Time,
 	valid bool,
 ) {
-
 	t := c.tibber.Snapshot()
 
 	tibberFresh :=
@@ -219,114 +262,78 @@ func (c *EnergyController) getEnergySource(
 			t.LastUpdate != "" &&
 			t.AgeSeconds <= int64(cfg.TibberTimeoutSeconds)
 
-	currentHour := hourStart(now)
-
 	if tibberFresh {
-		// Tibber power is grid import. Do not treat export as
-		// negative consumption for the hourly import controller.
 		powerW = math.Max(t.PowerW, 0)
 
-		// Seed/update the conservative fallback from the latest
-		// trustworthy Tibber hourly value.
+		referenceTime, ok := tibberReferenceTime(t)
+		if !ok {
+			// The Tibber measurement timestamp is the preferred clock.
+			// Falling back to the local clock keeps the controller usable if
+			// Tibber ever omits or changes the timestamp field.
+			referenceTime = now
+		}
+
 		c.fallbackValid = true
-		c.fallbackHour = currentHour
+		c.fallbackHour = hourStart(referenceTime)
 		c.fallbackEnergyKWh =
 			t.AccumulatedConsumptionLastHourKWh
 		c.fallbackLast = now
+		c.fallbackReferenceTime = referenceTime
 
 		return "tibber",
 			t.AccumulatedConsumptionLastHourKWh,
 			powerW,
+			referenceTime,
 			true
 	}
 
 	if !c.fallbackValid {
-		return "none", 0, 0, false
+		return "none", 0, 0, time.Time{}, false
 	}
 
-	// If this controller stopped running for too long, integrating
-	// CENTRAL100 from the previous point would produce an unknown gap.
+	// If the controller stopped running for too long, the conservative
+	// fallback accumulator is no longer trustworthy.
 	maxGap :=
 		time.Duration(cfg.ControlIntervalSeconds*2+10) *
 			time.Second
 
-	if now.Sub(c.fallbackLast) > maxGap {
+	elapsed := now.Sub(c.fallbackLast)
+	if elapsed < 0 || elapsed > maxGap {
 		c.fallbackValid = false
-		return "none", 0, 0, false
+		return "none", 0, 0, time.Time{}, false
 	}
 
 	powerW = central100.ConservativePowerW()
+	referenceTime = c.fallbackReferenceTime.Add(elapsed)
 
-	if !c.fallbackHour.Equal(currentHour) {
-		// The controller stayed alive across an hour boundary while
-		// Tibber was unavailable. Start a new conservative accumulator.
-		//
-		// CENTRAL100 measures total consumption, so this will generally
-		// overestimate grid import when solar is producing.
-		c.fallbackHour = currentHour
-		c.fallbackEnergyKWh = 0
-		c.fallbackLast = currentHour
-	}
+	oldReferenceTime := c.fallbackReferenceTime
+	newHour := hourStart(referenceTime)
 
-	elapsed := now.Sub(c.fallbackLast)
+	if !c.fallbackHour.Equal(newHour) {
+		// At most one boundary can be crossed because elapsed is bounded by
+		// maxGap. Only integrate the part that belongs to the new hour.
+		boundary := nextHour(oldReferenceTime)
+		afterBoundary := referenceTime.Sub(boundary)
+		if afterBoundary < 0 {
+			afterBoundary = 0
+		}
 
-	if elapsed > 0 {
+		c.fallbackHour = newHour
+		c.fallbackEnergyKWh =
+			powerW * afterBoundary.Hours() / 1000.0
+	} else if elapsed > 0 {
 		c.fallbackEnergyKWh +=
-			powerW *
-				elapsed.Hours() /
-				1000.0
+			powerW * elapsed.Hours() / 1000.0
 	}
 
 	c.fallbackLast = now
+	c.fallbackReferenceTime = referenceTime
 
 	return "central100",
 		c.fallbackEnergyKWh,
 		powerW,
+		referenceTime,
 		true
-}
-
-func populateEnergyDiagnostics(
-	s *ControllerSnapshot,
-	now time.Time,
-	cfg Config,
-	source string,
-	hourEnergy float64,
-	gridPower float64,
-	valid bool,
-) {
-
-	s.Source = source
-	s.EnergyValid = valid
-
-	if !valid {
-		return
-	}
-
-	s.HourEnergyKWh = hourEnergy
-	s.GridPowerW = gridPower
-
-	remainingEnergy :=
-		cfg.HourlyLimitKWh - hourEnergy
-
-	if remainingEnergy < 0 {
-		remainingEnergy = 0
-	}
-
-	s.RemainingEnergyKWh = remainingEnergy
-
-	secondsRemaining :=
-		int(nextHour(now).Sub(now).Seconds())
-
-	if secondsRemaining < 1 {
-		secondsRemaining = 1
-	}
-
-	s.SecondsRemaining = secondsRemaining
-
-	s.AllowedAveragePowerW =
-		remainingEnergy *
-			3600000.0 /
-			float64(secondsRemaining)
 }
 
 func (c *EnergyController) Run(ctx context.Context) {
@@ -355,23 +362,155 @@ func (c *EnergyController) Run(ctx context.Context) {
 	}
 }
 
+func phaseMode(m GaroMeterInfo) string {
+	a, b, d := m.CurrentsA()
+	currents := []float64{
+		math.Abs(a),
+		math.Abs(b),
+		math.Abs(d),
+	}
+
+	active := make([]float64, 0, 3)
+	for _, current := range currents {
+		if current >= chargingThresholdA {
+			active = append(active, current)
+		}
+	}
+
+	switch len(active) {
+	case 0:
+		return "idle"
+	case 1:
+		return "one-phase"
+	case 2:
+		return "mixed"
+	}
+
+	minA := active[0]
+	maxA := active[0]
+	for _, current := range active[1:] {
+		minA = math.Min(minA, current)
+		maxA = math.Max(maxA, current)
+	}
+
+	// A balanced 3-phase car should be close across all three phases.
+	// A materially larger phase normally means a simultaneous 1-phase load.
+	if maxA-minA > 3.0 {
+		return "mixed"
+	}
+
+	return "three-phase"
+}
+
+func (c *EnergyController) adjustmentAge(now time.Time) time.Duration {
+	if c.lastAdjustment.IsZero() {
+		return 365 * 24 * time.Hour
+	}
+
+	age := now.Sub(c.lastAdjustment)
+	if age < 0 {
+		return 0
+	}
+
+	return age
+}
+
+func requiredUpDwell(headroomW float64) time.Duration {
+	switch {
+	case headroomW >= controlMidUpW:
+		return controlNormalDwell
+	case headroomW >= controlNearUpW:
+		return controlMidUpDwell
+	default:
+		return controlNearUpDwell
+	}
+}
+
+func populateMeterDiagnostics(
+	s *ControllerSnapshot,
+	central100 GaroMeterInfo,
+	central101 GaroMeterInfo,
+	currentLimit int,
+) {
+	c100a, c100b, c100c := central100.CurrentsA()
+	c101a, c101b, c101c := central101.CurrentsA()
+
+	s.Central100Phase1A = c100a
+	s.Central100Phase2A = c100b
+	s.Central100Phase3A = c100c
+
+	s.Central101Phase1A = c101a
+	s.Central101Phase2A = c101b
+	s.Central101Phase3A = c101c
+
+	s.DLMCurrentA = currentLimit
+	s.DLMHeadroomA =
+		float64(currentLimit) - central100.MaxCurrentA()
+
+	s.Charging = central101.MaxCurrentA() >= chargingThresholdA
+	s.PhaseMode = phaseMode(central101)
+}
+
+func populateEnergyDiagnostics(
+	s *ControllerSnapshot,
+	cfg Config,
+	source string,
+	hourEnergy float64,
+	gridPower float64,
+	referenceTime time.Time,
+	valid bool,
+) {
+	s.Source = source
+	s.EnergyValid = valid
+	s.GridPowerW = gridPower
+
+	if !valid {
+		return
+	}
+
+	s.HourEnergyKWh = hourEnergy
+	s.ReferenceTime = referenceTime.Format(time.RFC3339)
+
+	remainingEnergy :=
+		cfg.HourlyLimitKWh - hourEnergy
+	if remainingEnergy < 0 {
+		remainingEnergy = 0
+	}
+
+	s.RemainingEnergyKWh = remainingEnergy
+
+	secondsRemaining :=
+		int(nextHour(referenceTime).Sub(referenceTime).Seconds())
+	if secondsRemaining < 1 {
+		secondsRemaining = 1
+	}
+
+	s.SecondsRemaining = secondsRemaining
+	s.AllowedAveragePowerW =
+		remainingEnergy * 3600000.0 /
+			float64(secondsRemaining)
+
+	s.PowerHeadroomW =
+		s.AllowedAveragePowerW - gridPower
+}
+
 func (c *EnergyController) tick() {
 	now := time.Now()
 	cfg := c.getConfig()
 
 	s := ControllerSnapshot{
 		LastRun: now.Format(time.RFC3339),
-		State:   "monitoring",
+		State:   "idle",
 		Source:  "none",
 	}
 
-	//
-	// Always collect physical GARO status.
-	//
-	// This happens even in Disabled, Safe and Manual modes so the
-	// diagnostics page remains useful regardless of control mode.
-	//
+	age := c.adjustmentAge(now)
+	if age < 365*24*time.Hour {
+		s.LastAdjustmentAgeSeconds = int64(age.Seconds())
+	}
 
+	// Read GARO regardless of controller mode so the status page remains
+	// useful in disabled, safe and manual modes.
 	central100, err := c.garo.GetMeterInfo("CENTRAL100")
 	if err != nil {
 		s.State = "error"
@@ -394,69 +533,41 @@ func (c *EnergyController) tick() {
 	if err != nil {
 		s.State = "error"
 		s.Error = err.Error()
-		s.Decision = "could not read CENTRAL100 DLM limit"
+		s.Decision = "could not read DLM current limit"
 		c.setSnapshot(s)
 		return
 	}
 
-	s.DLMCurrentA = currentLimit
-
-	c100p1, c100p2, c100p3 := central100.CurrentsA()
-
-	s.Central100Phase1A = c100p1
-	s.Central100Phase2A = c100p2
-	s.Central100Phase3A = c100p3
-
-	c101p1, c101p2, c101p3 := central101.CurrentsA()
-
-	s.Central101Phase1A = c101p1
-	s.Central101Phase2A = c101p2
-	s.Central101Phase3A = c101p3
-
-	charging :=
-		central101.MaxCurrentA() >= chargingThresholdA
-
-	s.Charging = charging
-
-	//
-	// Always resolve the energy source and calculate the hourly budget.
-	//
-	// This means Safe/Manual/Disabled modes still show exactly what the
-	// automatic controller would currently see.
-	//
+	populateMeterDiagnostics(
+		&s,
+		central100,
+		central101,
+		currentLimit,
+	)
 
 	source,
 		hourEnergy,
 		gridPower,
-		valid :=
-		c.getEnergySource(
-			now,
-			cfg,
-			central100,
-		)
+		referenceTime,
+		valid := c.getEnergySource(
+		now,
+		cfg,
+		central100,
+	)
 
 	populateEnergyDiagnostics(
 		&s,
-		now,
 		cfg,
 		source,
 		hourEnergy,
 		gridPower,
+		referenceTime,
 		valid,
 	)
-
-	//
-	// Control-mode decisions begin here.
-	//
 
 	if !cfg.Enabled {
 		s.State = "disabled"
 		s.Decision = "controller disabled"
-
-		// Do not carry idle/session state into a later automatic run.
-		c.idleSince = time.Time{}
-		c.safeApplied = false
-
 		c.setSnapshot(s)
 		return
 	}
@@ -464,21 +575,12 @@ func (c *EnergyController) tick() {
 	if cfg.Mode != "automatic" {
 		s.State = cfg.Mode
 		s.Decision = "automatic controller not active"
-
-		// Starting Automatic later should begin a fresh idle timer.
-		c.idleSince = time.Time{}
-		c.safeApplied = false
-
 		c.setSnapshot(s)
 		return
 	}
 
-	//
-	// Automatic mode.
-	//
-
 	// Session idle handling.
-	if !charging {
+	if !s.Charging {
 		s.State = "idle"
 
 		if c.idleSince.IsZero() {
@@ -495,25 +597,29 @@ func (c *EnergyController) tick() {
 					currentLimit,
 					cfg.SafeCurrentA,
 				); err != nil {
-
 					s.Error = err.Error()
 					s.Decision =
 						"failed to restore safe current"
 				} else {
-					s.DLMCurrentA = cfg.SafeCurrentA
-					s.Decision =
-						fmt.Sprintf(
-							"session idle; restored %d A",
-							cfg.SafeCurrentA,
-						)
+					if currentLimit != cfg.SafeCurrentA {
+						c.lastAdjustment = now
+						c.lastAdjustmentDelta =
+							cfg.SafeCurrentA - currentLimit
+					}
 
+					s.DLMCurrentA = cfg.SafeCurrentA
+					s.DLMHeadroomA =
+						float64(cfg.SafeCurrentA) -
+							central100.MaxCurrentA()
+					s.Decision = fmt.Sprintf(
+						"session idle; restored %d A",
+						cfg.SafeCurrentA,
+					)
 					c.safeApplied = true
 				}
 			} else {
-				s.Decision =
-					"safe current already restored"
+				s.Decision = "safe current already restored"
 			}
-
 		} else {
 			s.Decision = fmt.Sprintf(
 				"idle for %ds",
@@ -525,7 +631,6 @@ func (c *EnergyController) tick() {
 		return
 	}
 
-	// Active charging session.
 	c.idleSince = time.Time{}
 	c.safeApplied = false
 
@@ -538,9 +643,13 @@ func (c *EnergyController) tick() {
 			currentLimit,
 			cfg.SafeCurrentA,
 		); err != nil {
-
 			s.Error = err.Error()
 		} else {
+			if currentLimit != cfg.SafeCurrentA {
+				c.lastAdjustment = now
+				c.lastAdjustmentDelta =
+					cfg.SafeCurrentA - currentLimit
+			}
 			s.DLMCurrentA = cfg.SafeCurrentA
 		}
 
@@ -550,44 +659,97 @@ func (c *EnergyController) tick() {
 
 	s.State = "automatic"
 
+	remainingEnergy := s.RemainingEnergyKWh
+	allowedPower := s.AllowedAveragePowerW
+	headroomW := s.PowerHeadroomW
+	maxSiteCurrentA := central100.MaxCurrentA()
+	adjustmentAge := c.adjustmentAge(now)
+
 	target := currentLimit
+	step := 0
 
-	//
-	// Normal regulation.
-	//
-	// Use small adjustments because GARO itself rate-limits pilot
-	// changes and large downward changes have produced undesirable
-	// drops to the minimum pilot during testing.
-	//
-
-	if s.RemainingEnergyKWh <= 0 {
+	// If the hourly budget is exhausted, move directly to the configured
+	// minimum. The future hard-stop/availability action remains separate.
+	if remainingEnergy <= 0 {
 		target = cfg.MinimumCurrentA
 		s.Decision = "hourly budget exhausted"
 
-	} else if s.GridPowerW >
-		s.AllowedAveragePowerW+controlDownDeadbandW {
+	} else if headroomW < -controlDownDeadbandW {
+		// Downward control is faster than upward control, but still waits
+		// long enough for GARO to react before stacking another reduction.
+		if adjustmentAge < controlNormalDwell {
+			s.Decision = fmt.Sprintf(
+				"hold: %.0f W over target; waiting for previous DLM change (%ds/%ds)",
+				-headroomW,
+				int(adjustmentAge.Seconds()),
+				int(controlNormalDwell.Seconds()),
+			)
+		} else {
+			step = -1
+			if headroomW <= -controlUrgentDownW {
+				step = -2
+			}
 
-		target = currentLimit - 1
-
-		s.Decision = fmt.Sprintf(
-			"reduce: %.0f W > %.0f W allowed",
-			s.GridPowerW,
-			s.AllowedAveragePowerW,
-		)
-
-	} else if s.GridPowerW <
-		s.AllowedAveragePowerW-controlUpDeadbandW {
-
-		target = currentLimit + 1
-
-		s.Decision = fmt.Sprintf(
-			"increase: %.0f W < %.0f W allowed",
-			s.GridPowerW,
-			s.AllowedAveragePowerW,
-		)
+			target = currentLimit + step
+			s.Decision = fmt.Sprintf(
+				"reduce %d A: %.0f W > %.0f W allowed",
+				-step,
+				gridPower,
+				allowedPower,
+			)
+		}
 
 	} else {
-		s.Decision = "within control band"
+		// Upward control deliberately waits for GARO to use the current
+		// allocation. If CENTRAL100 is still materially below DLM100,
+		// increasing DLM again would only stack another change before the
+		// previous pilot response has appeared.
+		upGateW := controlOnePhaseUpGateW
+		if s.PhaseMode != "one-phase" {
+			// At ~240 V, one additional balanced 3-phase amp is ~720 W.
+			// 800 W leaves a small measurement/voltage margin.
+			upGateW = controlMultiPhaseGateW
+		}
+
+		switch {
+		case headroomW < upGateW:
+			s.Decision = fmt.Sprintf(
+				"within upward band: %.0f W headroom (%s gate %.0f W)",
+				headroomW,
+				s.PhaseMode,
+				upGateW,
+			)
+
+		case float64(currentLimit)-maxSiteCurrentA > garoUnusedHeadroomA:
+			s.Decision = fmt.Sprintf(
+				"hold increase: GARO still has %.1f A unused DLM headroom",
+				float64(currentLimit)-maxSiteCurrentA,
+			)
+
+		default:
+			dwell := requiredUpDwell(headroomW)
+			if adjustmentAge < dwell {
+				s.Decision = fmt.Sprintf(
+					"hold increase: %.0f W headroom; waiting %ds/%ds",
+					headroomW,
+					int(adjustmentAge.Seconds()),
+					int(dwell.Seconds()),
+				)
+			} else {
+				step = 1
+				if headroomW >= controlFastUpW {
+					step = 2
+				}
+
+				target = currentLimit + step
+				s.Decision = fmt.Sprintf(
+					"increase %d A: %.0f W below %.0f W allowed",
+					step,
+					headroomW,
+					allowedPower,
+				)
+			}
+		}
 	}
 
 	if target < cfg.MinimumCurrentA {
@@ -599,6 +761,11 @@ func (c *EnergyController) tick() {
 	}
 
 	if target == currentLimit {
+		if currentLimit == cfg.MaximumCurrentA &&
+			headroomW >= controlOnePhaseUpGateW {
+			s.Decision += "; at maximum DLM current"
+		}
+
 		c.setSnapshot(s)
 		return
 	}
@@ -610,7 +777,13 @@ func (c *EnergyController) tick() {
 		return
 	}
 
+	c.lastAdjustment = now
+	c.lastAdjustmentDelta = target - currentLimit
+
 	s.DLMCurrentA = target
+	s.DLMHeadroomA =
+		float64(target) - maxSiteCurrentA
+	s.LastAdjustmentAgeSeconds = 0
 
 	s.Decision += fmt.Sprintf(
 		"; DLM %d -> %d A",
