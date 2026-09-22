@@ -424,7 +424,9 @@ func main() {
 
 			decoder.DisallowUnknownFields()
 
-			var newCfg Config
+			// Decode on top of the current configuration so newly added tuning
+			// fields retain their existing/default values if an older client omits them.
+			newCfg := store.Get()
 
 			if err := decoder.Decode(&newCfg); err != nil {
 
@@ -579,7 +581,7 @@ body {
 
     font-family: sans-serif;
 
-    max-width: 760px;
+    max-width: 920px;
 
     margin: 40px auto;
 
@@ -815,6 +817,38 @@ button {
 
 <tr>
 
+    <td>Phase mode</td>
+
+    <td id="phaseMode">...</td>
+
+</tr>
+
+<tr>
+
+    <td>Power headroom</td>
+
+    <td id="powerHeadroom">...</td>
+
+</tr>
+
+<tr>
+
+    <td>Unused DLM headroom</td>
+
+    <td id="dlmHeadroom">...</td>
+
+</tr>
+
+<tr>
+
+    <td>Last DLM adjustment</td>
+
+    <td id="lastAdjustment">...</td>
+
+</tr>
+
+<tr>
+
     <td>Control source</td>
 
     <td id="controlSource">...</td>
@@ -1006,6 +1040,63 @@ button {
     <input id="tibberHomeId" type="text">
 
 </div>
+
+</div>
+
+<h2>Control tuning</h2>
+
+<div class="config-grid">
+
+<label for="downDeadband">Downward deadband</label>
+<div><input id="downDeadband" type="number" min="0" step="50"> W</div>
+
+<label for="urgentDown">Urgent downward threshold</label>
+<div><input id="urgentDown" type="number" min="0" step="50"> W</div>
+
+<label for="onePhaseGate">1-phase upward gate</label>
+<div><input id="onePhaseGate" type="number" min="0" step="50"> W</div>
+
+<label for="onePhaseTwoAmp">1-phase +2 A threshold</label>
+<div><input id="onePhaseTwoAmp" type="number" min="0" step="50"> W</div>
+
+<label for="onePhaseCalculated">1-phase calculated threshold</label>
+<div><input id="onePhaseCalculated" type="number" min="0" step="50"> W</div>
+
+<label for="onePhaseMaxStep">1-phase calculated max step</label>
+<div><input id="onePhaseMaxStep" type="number" min="1" max="32" step="1"> A</div>
+
+<label for="onePhaseWattsPerAmp">1-phase watts per amp</label>
+<div><input id="onePhaseWattsPerAmp" type="number" min="1" step="1"> W/A</div>
+
+<label for="multiPhaseGate">3-phase/mixed upward gate</label>
+<div><input id="multiPhaseGate" type="number" min="0" step="50"> W</div>
+
+<label for="multiPhaseTwoAmp">3-phase/mixed +2 A threshold</label>
+<div><input id="multiPhaseTwoAmp" type="number" min="0" step="50"> W</div>
+
+<label for="multiPhaseCalculated">3-phase/mixed calculated threshold</label>
+<div><input id="multiPhaseCalculated" type="number" min="0" step="50"> W</div>
+
+<label for="multiPhaseMaxStep">3-phase/mixed calculated max step</label>
+<div><input id="multiPhaseMaxStep" type="number" min="1" max="32" step="1"> A</div>
+
+<label for="multiPhaseWattsPerAmp">3-phase/mixed watts per amp</label>
+<div><input id="multiPhaseWattsPerAmp" type="number" min="1" step="1"> W/A</div>
+
+<label for="calculatedReserve">Calculated increase reserve</label>
+<div><input id="calculatedReserve" type="number" min="0" step="50"> W</div>
+
+<label for="normalDwell">Normal dwell</label>
+<div><input id="normalDwell" type="number" min="0" step="1"> s</div>
+
+<label for="midUpDwell">Mid upward dwell</label>
+<div><input id="midUpDwell" type="number" min="0" step="1"> s</div>
+
+<label for="nearUpDwell">Near-target upward dwell</label>
+<div><input id="nearUpDwell" type="number" min="0" step="1"> s</div>
+
+<label for="unusedDlmHeadroom">Unused DLM headroom threshold</label>
+<div><input id="unusedDlmHeadroom" type="number" min="0" step="0.1"> A</div>
 
 </div>
 
@@ -1227,6 +1318,24 @@ async function refreshStatus() {
 
             c.charging ? "Yes" : "No";
 
+        document.getElementById("phaseMode").textContent =
+            c.phase_mode || "-";
+
+        document.getElementById("powerHeadroom").textContent =
+            c.energy_valid
+                ? Math.round(c.power_headroom_w) + " W"
+                : "-";
+
+        document.getElementById("dlmHeadroom").textContent =
+            c.dlm_headroom_a !== undefined
+                ? c.dlm_headroom_a.toFixed(1) + " A"
+                : "-";
+
+        document.getElementById("lastAdjustment").textContent =
+            c.last_adjustment_age_seconds !== undefined
+                ? c.last_adjustment_age_seconds + " s ago"
+                : "-";
+
 
 
         document.getElementById("controlSource").textContent =
@@ -1369,6 +1478,26 @@ async function loadConfiguration() {
 
             c.tibber_home_id || "";
 
+        const t = c.control_tuning || {};
+
+        document.getElementById("downDeadband").value = t.down_deadband_w;
+        document.getElementById("urgentDown").value = t.urgent_down_w;
+        document.getElementById("onePhaseGate").value = t.one_phase_up_gate_w;
+        document.getElementById("onePhaseTwoAmp").value = t.one_phase_two_amp_threshold_w;
+        document.getElementById("onePhaseCalculated").value = t.one_phase_calculated_threshold_w;
+        document.getElementById("onePhaseMaxStep").value = t.one_phase_max_calculated_step_a;
+        document.getElementById("onePhaseWattsPerAmp").value = t.one_phase_watts_per_amp;
+        document.getElementById("multiPhaseGate").value = t.multi_phase_up_gate_w;
+        document.getElementById("multiPhaseTwoAmp").value = t.multi_phase_two_amp_threshold_w;
+        document.getElementById("multiPhaseCalculated").value = t.multi_phase_calculated_threshold_w;
+        document.getElementById("multiPhaseMaxStep").value = t.multi_phase_max_calculated_step_a;
+        document.getElementById("multiPhaseWattsPerAmp").value = t.multi_phase_watts_per_amp;
+        document.getElementById("calculatedReserve").value = t.calculated_reserve_w;
+        document.getElementById("normalDwell").value = t.normal_dwell_seconds;
+        document.getElementById("midUpDwell").value = t.mid_up_dwell_seconds;
+        document.getElementById("nearUpDwell").value = t.near_up_dwell_seconds;
+        document.getElementById("unusedDlmHeadroom").value = t.unused_dlm_headroom_a;
+
     } catch (e) {
 
         document.getElementById("error").textContent =
@@ -1453,7 +1582,27 @@ async function saveConfig() {
 
         tibber_home_id:
 
-            document.getElementById("tibberHomeId").value.trim()
+            document.getElementById("tibberHomeId").value.trim(),
+
+        control_tuning: {
+            down_deadband_w: Number(document.getElementById("downDeadband").value),
+            urgent_down_w: Number(document.getElementById("urgentDown").value),
+            one_phase_up_gate_w: Number(document.getElementById("onePhaseGate").value),
+            one_phase_two_amp_threshold_w: Number(document.getElementById("onePhaseTwoAmp").value),
+            one_phase_calculated_threshold_w: Number(document.getElementById("onePhaseCalculated").value),
+            one_phase_max_calculated_step_a: Number(document.getElementById("onePhaseMaxStep").value),
+            one_phase_watts_per_amp: Number(document.getElementById("onePhaseWattsPerAmp").value),
+            multi_phase_up_gate_w: Number(document.getElementById("multiPhaseGate").value),
+            multi_phase_two_amp_threshold_w: Number(document.getElementById("multiPhaseTwoAmp").value),
+            multi_phase_calculated_threshold_w: Number(document.getElementById("multiPhaseCalculated").value),
+            multi_phase_max_calculated_step_a: Number(document.getElementById("multiPhaseMaxStep").value),
+            multi_phase_watts_per_amp: Number(document.getElementById("multiPhaseWattsPerAmp").value),
+            calculated_reserve_w: Number(document.getElementById("calculatedReserve").value),
+            normal_dwell_seconds: Number(document.getElementById("normalDwell").value),
+            mid_up_dwell_seconds: Number(document.getElementById("midUpDwell").value),
+            near_up_dwell_seconds: Number(document.getElementById("nearUpDwell").value),
+            unused_dlm_headroom_a: Number(document.getElementById("unusedDlmHeadroom").value)
+        }
 
     };
 

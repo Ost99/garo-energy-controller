@@ -13,24 +13,6 @@ import (
 const (
 	chargingThresholdA = 2.0
 
-	// Power-control bands. Grid power is compared with the average power
-	// that can still be imported without exceeding the configured hourly
-	// energy limit.
-	controlDownDeadbandW   = 300.0
-	controlUrgentDownW     = 1500.0
-	controlFastUpW         = 4000.0
-	controlMidUpW          = 2500.0
-	controlNearUpW         = 1000.0
-	controlOnePhaseUpGateW = 400.0
-	controlMultiPhaseGateW = 800.0
-
-	// GARO reacts more slowly than our 30 s sampling loop. Do not stack
-	// normal changes while the previous one is still propagating.
-	controlNormalDwell  = 60 * time.Second
-	controlMidUpDwell   = 90 * time.Second
-	controlNearUpDwell  = 120 * time.Second
-	garoUnusedHeadroomA = 1.0
-
 	// Conservative fallback estimate. CENTRAL100 measures total site
 	// consumption, not net grid import.
 	fallbackVoltage = 230.0
@@ -415,15 +397,45 @@ func (c *EnergyController) adjustmentAge(now time.Time) time.Duration {
 	return age
 }
 
-func requiredUpDwell(headroomW float64) time.Duration {
+func requiredUpDwell(
+	headroomW float64,
+	upGateW float64,
+	twoAmpThresholdW float64,
+	tuning ControlTuningConfig,
+) time.Duration {
 	switch {
-	case headroomW >= controlMidUpW:
-		return controlNormalDwell
-	case headroomW >= controlNearUpW:
-		return controlMidUpDwell
+	case headroomW >= twoAmpThresholdW:
+		return time.Duration(tuning.NormalDwellSeconds) * time.Second
+	case headroomW >= upGateW:
+		return time.Duration(tuning.MidUpDwellSeconds) * time.Second
 	default:
-		return controlNearUpDwell
+		return time.Duration(tuning.NearUpDwellSeconds) * time.Second
 	}
+}
+
+func clampInt(value, minValue, maxValue int) int {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func calculatedUpStep(
+	headroomW float64,
+	wattsPerAmp float64,
+	reserveW float64,
+	maxStepA int,
+) int {
+	usableHeadroomW := headroomW - reserveW
+	if usableHeadroomW <= 0 || wattsPerAmp <= 0 {
+		return 1
+	}
+
+	step := int(math.Floor(usableHeadroomW / wattsPerAmp))
+	return clampInt(step, 1, maxStepA)
 }
 
 func populateMeterDiagnostics(
@@ -674,19 +686,21 @@ func (c *EnergyController) tick() {
 		target = cfg.MinimumCurrentA
 		s.Decision = "hourly budget exhausted"
 
-	} else if headroomW < -controlDownDeadbandW {
+	} else if headroomW < -cfg.ControlTuning.DownDeadbandW {
+		normalDwell := time.Duration(cfg.ControlTuning.NormalDwellSeconds) * time.Second
+
 		// Downward control is faster than upward control, but still waits
 		// long enough for GARO to react before stacking another reduction.
-		if adjustmentAge < controlNormalDwell {
+		if adjustmentAge < normalDwell {
 			s.Decision = fmt.Sprintf(
 				"hold: %.0f W over target; waiting for previous DLM change (%ds/%ds)",
 				-headroomW,
 				int(adjustmentAge.Seconds()),
-				int(controlNormalDwell.Seconds()),
+				int(normalDwell.Seconds()),
 			)
 		} else {
 			step = -1
-			if headroomW <= -controlUrgentDownW {
+			if headroomW <= -cfg.ControlTuning.UrgentDownW {
 				step = -2
 			}
 
@@ -700,16 +714,24 @@ func (c *EnergyController) tick() {
 		}
 
 	} else {
-		// Upward control deliberately waits for GARO to use the current
-		// allocation. If CENTRAL100 is still materially below DLM100,
-		// increasing DLM again would only stack another change before the
-		// previous pilot response has appeared.
-		upGateW := controlOnePhaseUpGateW
-		if s.PhaseMode != "one-phase" {
-			// At ~240 V, one additional balanced 3-phase amp is ~720 W.
-			// 800 W leaves a small measurement/voltage margin.
-			upGateW = controlMultiPhaseGateW
+		onePhase := s.PhaseMode == "one-phase"
+
+		upGateW := cfg.ControlTuning.MultiPhaseUpGateW
+		twoAmpThresholdW := cfg.ControlTuning.MultiPhaseTwoAmpThresholdW
+		calculatedThresholdW := cfg.ControlTuning.MultiPhaseCalculatedThresholdW
+		maxCalculatedStepA := cfg.ControlTuning.MultiPhaseMaxCalculatedStepA
+		wattsPerAmp := cfg.ControlTuning.MultiPhaseWattsPerAmp
+
+		if onePhase {
+			upGateW = cfg.ControlTuning.OnePhaseUpGateW
+			twoAmpThresholdW = cfg.ControlTuning.OnePhaseTwoAmpThresholdW
+			calculatedThresholdW = cfg.ControlTuning.OnePhaseCalculatedThresholdW
+			maxCalculatedStepA = cfg.ControlTuning.OnePhaseMaxCalculatedStepA
+			wattsPerAmp = cfg.ControlTuning.OnePhaseWattsPerAmp
 		}
+
+		unusedDLMHeadroomA := float64(currentLimit) - maxSiteCurrentA
+		normalDwell := time.Duration(cfg.ControlTuning.NormalDwellSeconds) * time.Second
 
 		switch {
 		case headroomW < upGateW:
@@ -720,14 +742,52 @@ func (c *EnergyController) tick() {
 				upGateW,
 			)
 
-		case float64(currentLimit)-maxSiteCurrentA > garoUnusedHeadroomA:
+		case headroomW > calculatedThresholdW:
+			// Far below target: give GARO enough DLM ceiling for its own pilot
+			// ramp instead of feeding it one amp at a time. After an upward
+			// change, do not stack another calculated jump until GARO has used
+			// the outstanding allocation.
+			if c.lastAdjustmentDelta > 0 &&
+				unusedDLMHeadroomA > cfg.ControlTuning.UnusedDLMHeadroomA {
+				s.Decision = fmt.Sprintf(
+					"hold calculated increase: GARO still has %.1f A unused DLM headroom",
+					unusedDLMHeadroomA,
+				)
+			} else if adjustmentAge < normalDwell {
+				s.Decision = fmt.Sprintf(
+					"hold calculated increase: %.0f W headroom; waiting %ds/%ds",
+					headroomW,
+					int(adjustmentAge.Seconds()),
+					int(normalDwell.Seconds()),
+				)
+			} else {
+				step = calculatedUpStep(
+					headroomW,
+					wattsPerAmp,
+					cfg.ControlTuning.CalculatedReserveW,
+					maxCalculatedStepA,
+				)
+				target = currentLimit + step
+				s.Decision = fmt.Sprintf(
+					"calculated increase %d A: %.0f W headroom, %.0f W reserve, %.0f W/A (%s)",
+					step,
+					headroomW,
+					cfg.ControlTuning.CalculatedReserveW,
+					wattsPerAmp,
+					s.PhaseMode,
+				)
+			}
+
+		case unusedDLMHeadroomA > cfg.ControlTuning.UnusedDLMHeadroomA:
+			// Nearer the target, do not increase while GARO still has unused
+			// current authority from the existing DLM setting.
 			s.Decision = fmt.Sprintf(
 				"hold increase: GARO still has %.1f A unused DLM headroom",
-				float64(currentLimit)-maxSiteCurrentA,
+				unusedDLMHeadroomA,
 			)
 
 		default:
-			dwell := requiredUpDwell(headroomW)
+			dwell := requiredUpDwell(headroomW, upGateW, twoAmpThresholdW, cfg.ControlTuning)
 			if adjustmentAge < dwell {
 				s.Decision = fmt.Sprintf(
 					"hold increase: %.0f W headroom; waiting %ds/%ds",
@@ -737,16 +797,16 @@ func (c *EnergyController) tick() {
 				)
 			} else {
 				step = 1
-				if headroomW >= controlFastUpW {
+				if headroomW >= twoAmpThresholdW {
 					step = 2
 				}
 
 				target = currentLimit + step
 				s.Decision = fmt.Sprintf(
-					"increase %d A: %.0f W below %.0f W allowed",
+					"increase %d A: %.0f W headroom (%s)",
 					step,
 					headroomW,
-					allowedPower,
+					s.PhaseMode,
 				)
 			}
 		}
@@ -761,8 +821,7 @@ func (c *EnergyController) tick() {
 	}
 
 	if target == currentLimit {
-		if currentLimit == cfg.MaximumCurrentA &&
-			headroomW >= controlOnePhaseUpGateW {
+		if currentLimit == cfg.MaximumCurrentA && headroomW > 0 {
 			s.Decision += "; at maximum DLM current"
 		}
 

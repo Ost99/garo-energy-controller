@@ -1,127 +1,209 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 )
 
+type ControlTuningConfig struct {
+	DownDeadbandW float64 `json:"down_deadband_w"`
+	UrgentDownW   float64 `json:"urgent_down_w"`
+
+	OnePhaseUpGateW              float64 `json:"one_phase_up_gate_w"`
+	OnePhaseTwoAmpThresholdW     float64 `json:"one_phase_two_amp_threshold_w"`
+	OnePhaseCalculatedThresholdW float64 `json:"one_phase_calculated_threshold_w"`
+	OnePhaseMaxCalculatedStepA   int     `json:"one_phase_max_calculated_step_a"`
+	OnePhaseWattsPerAmp          float64 `json:"one_phase_watts_per_amp"`
+
+	MultiPhaseUpGateW              float64 `json:"multi_phase_up_gate_w"`
+	MultiPhaseTwoAmpThresholdW     float64 `json:"multi_phase_two_amp_threshold_w"`
+	MultiPhaseCalculatedThresholdW float64 `json:"multi_phase_calculated_threshold_w"`
+	MultiPhaseMaxCalculatedStepA   int     `json:"multi_phase_max_calculated_step_a"`
+	MultiPhaseWattsPerAmp          float64 `json:"multi_phase_watts_per_amp"`
+
+	CalculatedReserveW float64 `json:"calculated_reserve_w"`
+
+	NormalDwellSeconds int `json:"normal_dwell_seconds"`
+	MidUpDwellSeconds  int `json:"mid_up_dwell_seconds"`
+	NearUpDwellSeconds int `json:"near_up_dwell_seconds"`
+
+	UnusedDLMHeadroomA float64 `json:"unused_dlm_headroom_a"`
+}
+
 type Config struct {
-	Enabled                bool    `json:"enabled"`
-	Mode                   string  `json:"mode"`
-	HourlyLimitKWh         float64 `json:"hourly_limit_kwh"`
-	TibberHomeID           string  `json:"tibber_home_id"`
-	SafeCurrentA           int     `json:"safe_current_a"`
-	MinimumCurrentA        int     `json:"minimum_current_a"`
-	MaximumCurrentA        int     `json:"maximum_current_a"`
-	ManualCurrentA         int     `json:"manual_current_a"`
-	TibberTimeoutSeconds   int     `json:"tibber_timeout_seconds"`
-	ControlIntervalSeconds int     `json:"control_interval_seconds"`
-	IdleTimeoutSeconds     int     `json:"idle_timeout_seconds"`
+	Enabled bool   `json:"enabled"`
+	Mode    string `json:"mode"`
+
+	HourlyLimitKWh float64 `json:"hourly_limit_kwh"`
+
+	SafeCurrentA    int `json:"safe_current_a"`
+	MinimumCurrentA int `json:"minimum_current_a"`
+	MaximumCurrentA int `json:"maximum_current_a"`
+	ManualCurrentA  int `json:"manual_current_a"`
+
+	TibberTimeoutSeconds   int `json:"tibber_timeout_seconds"`
+	ControlIntervalSeconds int `json:"control_interval_seconds"`
+	IdleTimeoutSeconds     int `json:"idle_timeout_seconds"`
+
+	TibberHomeID string `json:"tibber_home_id,omitempty"`
+
+	ControlTuning ControlTuningConfig `json:"control_tuning"`
+}
+
+func defaultControlTuning() ControlTuningConfig {
+	return ControlTuningConfig{
+		DownDeadbandW: 300,
+		UrgentDownW:   1500,
+
+		OnePhaseUpGateW:              400,
+		OnePhaseTwoAmpThresholdW:     1500,
+		OnePhaseCalculatedThresholdW: 2500,
+		OnePhaseMaxCalculatedStepA:   12,
+		OnePhaseWattsPerAmp:          240,
+
+		MultiPhaseUpGateW:              800,
+		MultiPhaseTwoAmpThresholdW:     2500,
+		MultiPhaseCalculatedThresholdW: 4000,
+		MultiPhaseMaxCalculatedStepA:   4,
+		MultiPhaseWattsPerAmp:          720,
+
+		CalculatedReserveW: 1000,
+
+		NormalDwellSeconds: 60,
+		MidUpDwellSeconds:  90,
+		NearUpDwellSeconds: 120,
+
+		UnusedDLMHeadroomA: 1.0,
+	}
 }
 
 func defaultConfig() Config {
 	return Config{
-		Enabled:                true,
-		Mode:                   "safe",
-		TibberHomeID:           "",
-		HourlyLimitKWh:         9.9,
-		SafeCurrentA:           8,
-		MinimumCurrentA:        6,
-		MaximumCurrentA:        50,
-		ManualCurrentA:         8,
+		Enabled: true,
+		Mode:    "safe",
+
+		HourlyLimitKWh: 9.5,
+
+		SafeCurrentA:    8,
+		MinimumCurrentA: 6,
+		MaximumCurrentA: 50,
+		ManualCurrentA:  8,
+
 		TibberTimeoutSeconds:   30,
 		ControlIntervalSeconds: 30,
 		IdleTimeoutSeconds:     120,
+
+		ControlTuning: defaultControlTuning(),
 	}
+}
+
+func (c Config) Validate() error {
+	switch c.Mode {
+	case "automatic", "safe", "manual":
+	default:
+		return fmt.Errorf("mode must be automatic, safe, or manual")
+	}
+
+	if c.HourlyLimitKWh <= 0 {
+		return fmt.Errorf("hourly_limit_kwh must be greater than 0")
+	}
+	if c.MinimumCurrentA < 6 {
+		return fmt.Errorf("minimum_current_a must be at least 6")
+	}
+	if c.MaximumCurrentA < c.MinimumCurrentA {
+		return fmt.Errorf("maximum_current_a must be >= minimum_current_a")
+	}
+	if c.SafeCurrentA < c.MinimumCurrentA || c.SafeCurrentA > c.MaximumCurrentA {
+		return fmt.Errorf("safe_current_a must be within the configured current range")
+	}
+	if c.ManualCurrentA < c.MinimumCurrentA || c.ManualCurrentA > c.MaximumCurrentA {
+		return fmt.Errorf("manual_current_a must be within the configured current range")
+	}
+	if c.TibberTimeoutSeconds < 5 {
+		return fmt.Errorf("tibber_timeout_seconds must be at least 5")
+	}
+	if c.ControlIntervalSeconds < 5 {
+		return fmt.Errorf("control_interval_seconds must be at least 5")
+	}
+	if c.IdleTimeoutSeconds < 30 {
+		return fmt.Errorf("idle_timeout_seconds must be at least 30")
+	}
+
+	return c.ControlTuning.Validate()
+}
+
+func (t ControlTuningConfig) Validate() error {
+	if t.DownDeadbandW < 0 {
+		return fmt.Errorf("control_tuning.down_deadband_w must be >= 0")
+	}
+	if t.UrgentDownW < t.DownDeadbandW {
+		return fmt.Errorf("control_tuning.urgent_down_w must be >= down_deadband_w")
+	}
+
+	if t.OnePhaseUpGateW < 0 ||
+		t.OnePhaseTwoAmpThresholdW < t.OnePhaseUpGateW ||
+		t.OnePhaseCalculatedThresholdW <= t.OnePhaseTwoAmpThresholdW {
+		return fmt.Errorf("one-phase thresholds must satisfy gate <= +2A threshold < calculated threshold")
+	}
+	if t.MultiPhaseUpGateW < 0 ||
+		t.MultiPhaseTwoAmpThresholdW < t.MultiPhaseUpGateW ||
+		t.MultiPhaseCalculatedThresholdW <= t.MultiPhaseTwoAmpThresholdW {
+		return fmt.Errorf("multi-phase thresholds must satisfy gate <= +2A threshold < calculated threshold")
+	}
+
+	if t.OnePhaseMaxCalculatedStepA < 1 || t.OnePhaseMaxCalculatedStepA > 32 {
+		return fmt.Errorf("control_tuning.one_phase_max_calculated_step_a must be 1..32")
+	}
+	if t.MultiPhaseMaxCalculatedStepA < 1 || t.MultiPhaseMaxCalculatedStepA > 32 {
+		return fmt.Errorf("control_tuning.multi_phase_max_calculated_step_a must be 1..32")
+	}
+	if t.OnePhaseWattsPerAmp <= 0 || t.MultiPhaseWattsPerAmp <= 0 {
+		return fmt.Errorf("control_tuning watts-per-amp values must be greater than 0")
+	}
+	if t.CalculatedReserveW < 0 {
+		return fmt.Errorf("control_tuning.calculated_reserve_w must be >= 0")
+	}
+	if t.NormalDwellSeconds < 0 || t.MidUpDwellSeconds < 0 || t.NearUpDwellSeconds < 0 {
+		return fmt.Errorf("control_tuning dwell values must be >= 0")
+	}
+	if t.UnusedDLMHeadroomA < 0 {
+		return fmt.Errorf("control_tuning.unused_dlm_headroom_a must be >= 0")
+	}
+
+	return nil
 }
 
 func loadConfig(path string) (Config, error) {
 	cfg := defaultConfig()
 
 	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return cfg, nil
-	}
 	if err != nil {
-		return cfg, err
-	}
-
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-
-	if err := decoder.Decode(&cfg); err != nil {
-		return cfg, fmt.Errorf("parse config: %w", err)
-	}
-
-	// Reject trailing JSON/data.
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		if err == nil {
-			return cfg, fmt.Errorf("parse config: multiple JSON values")
+		if os.IsNotExist(err) {
+			return cfg, nil
 		}
-		return cfg, fmt.Errorf("parse config: trailing data: %w", err)
+		return Config{}, err
 	}
 
-	if err := validateConfig(cfg); err != nil {
-		return cfg, err
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, fmt.Errorf("decode %s: %w", path, err)
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return Config{}, err
 	}
 
 	return cfg, nil
 }
 
-func validateConfig(cfg Config) error {
-	switch cfg.Mode {
-	case "automatic", "safe", "manual":
-	default:
-		return fmt.Errorf("invalid mode %q", cfg.Mode)
-	}
-
-	if cfg.HourlyLimitKWh <= 0 {
-		return fmt.Errorf("hourly_limit_kwh must be > 0")
-	}
-
-	if cfg.MinimumCurrentA < 6 {
-		return fmt.Errorf("minimum_current_a must be >= 6")
-	}
-
-	if cfg.MaximumCurrentA < cfg.MinimumCurrentA {
-		return fmt.Errorf("maximum_current_a must be >= minimum_current_a")
-	}
-
-	if cfg.SafeCurrentA < cfg.MinimumCurrentA ||
-		cfg.SafeCurrentA > cfg.MaximumCurrentA {
-		return fmt.Errorf("safe_current_a outside configured range")
-	}
-
-	if cfg.ManualCurrentA < cfg.MinimumCurrentA ||
-		cfg.ManualCurrentA > cfg.MaximumCurrentA {
-		return fmt.Errorf("manual_current_a outside configured range")
-	}
-
-	if cfg.TibberTimeoutSeconds < 5 {
-		return fmt.Errorf("tibber_timeout_seconds must be >= 5")
-	}
-
-	if cfg.ControlIntervalSeconds < 5 {
-		return fmt.Errorf("control_interval_seconds must be >= 5")
-	}
-
-	if cfg.IdleTimeoutSeconds < 30 {
-		return fmt.Errorf("idle_timeout_seconds must be >= 30")
-	}
-
-	return nil
-}
-
 type ConfigStore struct {
-	mu   sync.RWMutex
 	path string
-	cfg  Config
+
+	mu  sync.RWMutex
+	cfg Config
 }
 
 func NewConfigStore(path string, cfg Config) *ConfigStore {
@@ -138,21 +220,19 @@ func (s *ConfigStore) Get() Config {
 	return s.cfg
 }
 
-// Set validates and stores the new configuration.
-// The SD card is only written if the configuration actually changed.
 func (s *ConfigStore) Set(cfg Config) (bool, error) {
-	if err := validateConfig(cfg); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return false, err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if cfg == s.cfg {
+	if reflect.DeepEqual(s.cfg, cfg) {
 		return false, nil
 	}
 
-	if err := saveConfigAtomic(s.path, cfg); err != nil {
+	if err := writeConfigAtomic(s.path, cfg); err != nil {
 		return false, err
 	}
 
@@ -160,40 +240,32 @@ func (s *ConfigStore) Set(cfg Config) (bool, error) {
 	return true, nil
 }
 
-func saveConfigAtomic(path string, cfg Config) error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	data = append(data, '\n')
-
+func writeConfigAtomic(path string, cfg Config) error {
 	dir := filepath.Dir(path)
-
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 
-	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	mode := os.FileMode(0644)
+	if st, err := os.Stat(path); err == nil {
+		mode = st.Mode().Perm()
+	}
+
+	tmp, err := os.CreateTemp(dir, ".garo-energy-controller-config-*")
 	if err != nil {
 		return err
 	}
-
 	tmpName := tmp.Name()
-	removeTemp := true
+	defer os.Remove(tmpName)
 
-	defer func() {
-		if removeTemp {
-			os.Remove(tmpName)
-		}
-	}()
-
-	if err := tmp.Chmod(0644); err != nil {
+	if err := tmp.Chmod(mode); err != nil {
 		tmp.Close()
 		return err
 	}
 
-	if _, err := tmp.Write(data); err != nil {
+	encoder := json.NewEncoder(tmp)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(cfg); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -202,7 +274,6 @@ func saveConfigAtomic(path string, cfg Config) error {
 		tmp.Close()
 		return err
 	}
-
 	if err := tmp.Close(); err != nil {
 		return err
 	}
@@ -211,6 +282,10 @@ func saveConfigAtomic(path string, cfg Config) error {
 		return err
 	}
 
-	removeTemp = false
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+
 	return nil
 }
