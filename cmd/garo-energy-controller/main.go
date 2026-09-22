@@ -17,6 +17,8 @@ import (
 
 	"net/http"
 
+	"os"
+
 	"strconv"
 
 	"sync"
@@ -28,6 +30,9 @@ const (
 	listenAddress = ":8090"
 
 	garoBaseURL = "http://127.0.0.1:8080/servlet/rest/chargebox"
+
+	garoStableImageDir   = "/var/lib/tomcat8/webapps/serialweb/images"
+	garoFallbackImageDir = "/tmp/serialwebapp/webapp/images"
 )
 
 type GaroClient struct {
@@ -269,6 +274,20 @@ func applyMode(cfg Config, garo *GaroClient) error {
 
 }
 
+func findGaroImageDir() string {
+	for _, candidate := range []string{
+		garoStableImageDir,
+		garoFallbackImageDir,
+	} {
+		info, err := os.Stat(candidate)
+		if err == nil && info.IsDir() {
+			return candidate
+		}
+	}
+
+	return ""
+}
+
 func main() {
 
 	configPath := flag.String(
@@ -362,6 +381,19 @@ func main() {
 	)
 
 	go controller.Run(context.Background())
+
+	if imageDir := findGaroImageDir(); imageDir != "" {
+		log.Printf("serving GARO interface images from %s", imageDir)
+		http.Handle(
+			"/garo-assets/",
+			http.StripPrefix(
+				"/garo-assets/",
+				http.FileServer(http.Dir(imageDir)),
+			),
+		)
+	} else {
+		log.Printf("warning: GARO interface image directory not found")
+	}
 
 	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 
@@ -564,922 +596,420 @@ func main() {
 }
 
 const page = `<!doctype html>
-
 <html>
-
 <head>
-
 <meta charset="utf-8">
-
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GARO Energy Controller</title>
-
-
-
 <style>
-
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
 body {
-
-    font-family: sans-serif;
-
-    max-width: 920px;
-
-    margin: 40px auto;
-
-    padding: 0 20px;
-
+    font-family: Arial, Helvetica, sans-serif;
+    background: #f7f7f7;
+    color: #111;
+    font-size: 14px;
 }
-
-
-
-h2 {
-
-    margin-top: 32px;
-
-}
-
-
-
-table {
-
-    border-collapse: collapse;
-
-}
-
-
-
-td {
-
-    padding: 5px 20px 5px 0;
-
-}
-
-
-
-.config-grid {
-
-    display: grid;
-
-    grid-template-columns: 260px max-content;
-
-    gap: 10px 20px;
-
+.topbar {
+    height: 46px;
+    background: #e9e9e9;
+    border-bottom: 1px solid #d5d5d5;
+    display: flex;
     align-items: center;
-
+    justify-content: flex-end;
+    padding: 0 18px;
+    color: #444;
+    font-size: 13px;
 }
-
-.config-grid > div {
-
-    white-space: nowrap;
-
+.page {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 16px 16px 40px;
 }
-
-input[type="number"],
-
-input[type="text"],
-
-select {
-
-    width: 140px;
-
-    padding: 5px;
-
-    box-sizing: border-box;
-
+.logo-wrap {
+    text-align: center;
+    padding: 0 0 20px;
+    user-select: none;
 }
-
-
-
+#garoLogo {
+    width: 110px;
+    max-height: 62px;
+    object-fit: contain;
+    user-select: none;
+    -webkit-user-drag: none;
+}
+.status-strip {
+    background: #ececec;
+    border: 1px solid #d6d6d6;
+    border-radius: 5px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.12);
+    text-align: center;
+    font-weight: bold;
+    font-size: 16px;
+    padding: 12px 42px;
+    margin-bottom: 26px;
+}
+.section-label {
+    font-weight: bold;
+    font-size: 16px;
+    margin: 0 0 10px;
+}
+.panel {
+    background: #fff;
+    border: 1px solid #d5d5d5;
+    border-radius: 5px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.12);
+    margin-bottom: 16px;
+    overflow: hidden;
+}
+.panel-title {
+    background: linear-gradient(#fff, #f3f3f3);
+    border-bottom: 1px solid #ddd;
+    font-weight: bold;
+    font-size: 16px;
+    padding: 12px 16px;
+}
+.panel-body { padding: 14px 16px; }
+.device-row {
+    display: grid;
+    grid-template-columns: 76px minmax(0, 1fr);
+    gap: 14px;
+    align-items: center;
+    padding: 10px 8px;
+}
+.device-row + .device-row { border-top: 1px solid #ddd; }
+.device-icon {
+    width: 56px;
+    max-height: 82px;
+    object-fit: contain;
+    justify-self: center;
+}
+.device-name {
+    font-weight: bold;
+    font-size: 15px;
+    margin-bottom: 6px;
+}
+.data-line { margin: 4px 0; line-height: 1.35; }
+.data-label { font-weight: bold; }
+.status-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(280px, 1fr));
+    column-gap: 34px;
+    row-gap: 7px;
+}
+.status-item {
+    display: grid;
+    grid-template-columns: 190px minmax(0, 1fr);
+    gap: 10px;
+}
+.status-item .label { font-weight: bold; }
+.config-grid {
+    display: grid;
+    grid-template-columns: 280px max-content;
+    gap: 10px 20px;
+    align-items: center;
+}
+.config-grid > div { white-space: nowrap; }
+input[type="number"], input[type="text"], select {
+    width: 150px;
+    padding: 6px 7px;
+    border: 1px solid #bbb;
+    border-radius: 3px;
+    background: #fff;
+}
+input[type="checkbox"] { transform: translateY(1px); }
+.actions { margin-top: 18px; }
 button {
-
     padding: 8px 14px;
-
-    margin-right: 8px;
-
+    margin: 0 8px 0 0;
+    border: 1px solid #aaa;
+    border-radius: 4px;
+    background: linear-gradient(#fff, #e9e9e9);
+    cursor: pointer;
 }
-
-
-
-#message {
-
-    color: #080;
-
+button:hover { background: #eee; }
+.note { color: #666; font-size: 12px; margin-top: 12px; }
+#message { color: #087b12; }
+#error { color: #a00; white-space: pre-wrap; }
+.advanced .panel-title { background: #f2f2f2; }
+[hidden] { display: none !important; }
+@media (max-width: 760px) {
+    .status-grid { grid-template-columns: 1fr; }
+    .status-item { grid-template-columns: 165px minmax(0, 1fr); }
+    .config-grid { grid-template-columns: 1fr; gap: 4px; }
+    .config-grid label { margin-top: 8px; }
 }
-
-
-
-#error {
-
-    color: #a00;
-
-}
-
-
-
-.note {
-
-    color: #666;
-
-    font-size: 0.9em;
-
-}
-
 </style>
-
 </head>
-
-
-
 <body>
-
-
-
-<h1>GARO Energy Controller</h1>
-
-
-
-<h2>Status</h2>
-
-
-
-<table>
-
-<tr>
-
-    <td>GARO</td>
-
-    <td id="garo">...</td>
-
-</tr>
-
-<tr>
-
-    <td>CENTRAL100 limit</td>
-
-    <td id="fuse100">...</td>
-
-</tr>
-
-<tr>
-
-    <td>CENTRAL101 limit</td>
-
-    <td id="fuse101">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Controller</td>
-
-    <td id="controllerStatus">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Tibber</td>
-
-    <td id="tibber">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Tibber home</td>
-
-    <td id="tibberHome">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Grid import now</td>
-
-    <td id="tibberPower">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Grid export now</td>
-
-    <td id="tibberProduction">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Imported this hour</td>
-
-    <td id="tibberHour">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Tibber data age</td>
-
-    <td id="tibberAge">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Tibber API requests</td>
-
-    <td id="tibberApiRequests">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Last Tibber API request</td>
-
-    <td id="tibberApiLast">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Last Tibber API result</td>
-
-    <td id="tibberApiResult">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Charging</td>
-
-    <td id="charging">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Phase mode</td>
-
-    <td id="phaseMode">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Power headroom</td>
-
-    <td id="powerHeadroom">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Unused DLM headroom</td>
-
-    <td id="dlmHeadroom">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Last DLM adjustment</td>
-
-    <td id="lastAdjustment">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Control source</td>
-
-    <td id="controlSource">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Hourly consumption</td>
-
-    <td id="hourEnergy">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Remaining allowance</td>
-
-    <td id="remainingEnergy">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Allowed average power</td>
-
-    <td id="allowedPower">...</td>
-
-</tr>
-
-<tr>
-
-    <td>Controller decision</td>
-
-    <td id="decision">...</td>
-
-</tr>
-
-<tr>
-
-    <td>CENTRAL100 current</td>
-
-    <td id="central100Current">...</td>
-
-</tr>
-
-<tr>
-
-    <td>CENTRAL101 current</td>
-
-    <td id="central101Current">...</td>
-
-</tr>
-
-
-
-
-
-</table>
-
-
-
-<h2>Configuration</h2>
-
-
-
-<div class="config-grid">
-
-
-
-<label for="enabled">Enabled</label>
-
-<input id="enabled" type="checkbox">
-
-
-
-<label for="mode">Mode</label>
-
-<select id="mode">
-
-    <option value="automatic">Automatic</option>
-
-    <option value="safe">Safe</option>
-
-    <option value="manual">Manual</option>
-
-</select>
-
-
-
-<label for="hourlyLimit">Hourly grid limit</label>
-
-<div>
-
-    <input id="hourlyLimit" type="number"
-
-        min="0.1" step="0.01"> kWh
-
+<div class="topbar">
+    <span>GARO Energy Controller</span>
 </div>
 
+<div class="page">
+    <div class="logo-wrap">
+        <img id="garoLogo" src="/garo-assets/garologo.png" alt="GARO">
+    </div>
 
+    <div id="topStatus" class="status-strip">Loading...</div>
 
-<label for="safeCurrent">Safe/default current</label>
+    <div class="section-label">Controller</div>
+    <section class="panel">
+        <div class="device-row">
+            <img class="device-icon" src="/garo-assets/single.png" alt="Wallbox">
+            <div>
+                <div class="device-name">Energy controller</div>
+                <div class="data-line"><span class="data-label">Mode:</span> <span id="controllerStatus">...</span></div>
+                <div class="data-line"><span class="data-label">Charging:</span> <span id="charging">...</span></div>
+                <div class="data-line"><span class="data-label">Phase mode:</span> <span id="phaseMode">...</span></div>
+                <div class="data-line"><span class="data-label">Decision:</span> <span id="decision">...</span></div>
+            </div>
+        </div>
+    </section>
 
-<div>
+    <section class="panel">
+        <div class="panel-title">Loadbalancingmeter</div>
+        <div class="panel-body">
+            <div class="device-row">
+                <img class="device-icon" src="/garo-assets/dlm.png" alt="Load balancing meter">
+                <div>
+                    <div class="device-name">Loadbalancingmeter 100</div>
+                    <div class="data-line"><span class="data-label">Configured limit:</span> <span id="fuse100">...</span></div>
+                    <div class="data-line"><span class="data-label">Phase current:</span> <span id="central100Current">...</span></div>
+                    <div class="data-line"><span class="data-label">Unused DLM headroom:</span> <span id="dlmHeadroom">...</span></div>
+                </div>
+            </div>
+            <div class="device-row">
+                <img class="device-icon" src="/garo-assets/dlm.png" alt="Load balancing meter">
+                <div>
+                    <div class="device-name">Loadbalancingmeter 101</div>
+                    <div class="data-line"><span class="data-label">Configured limit:</span> <span id="fuse101">...</span></div>
+                    <div class="data-line"><span class="data-label">Phase current:</span> <span id="central101Current">...</span></div>
+                </div>
+            </div>
+        </div>
+    </section>
 
-    <input id="safeCurrent" type="number"
+    <section class="panel">
+        <div class="panel-title">Grid energy</div>
+        <div class="panel-body status-grid">
+            <div class="status-item"><span class="label">GARO</span><span id="garo">...</span></div>
+            <div class="status-item"><span class="label">Tibber</span><span id="tibber">...</span></div>
+            <div class="status-item"><span class="label">Tibber home</span><span id="tibberHome">...</span></div>
+            <div class="status-item"><span class="label">Control source</span><span id="controlSource">...</span></div>
+            <div class="status-item"><span class="label">Grid import now</span><span id="tibberPower">...</span></div>
+            <div class="status-item"><span class="label">Grid export now</span><span id="tibberProduction">...</span></div>
+            <div class="status-item"><span class="label">Imported this hour</span><span id="tibberHour">...</span></div>
+            <div class="status-item"><span class="label">Controller hour energy</span><span id="hourEnergy">...</span></div>
+            <div class="status-item"><span class="label">Remaining allowance</span><span id="remainingEnergy">...</span></div>
+            <div class="status-item"><span class="label">Allowed average power</span><span id="allowedPower">...</span></div>
+            <div class="status-item"><span class="label">Power headroom</span><span id="powerHeadroom">...</span></div>
+            <div class="status-item"><span class="label">Last DLM adjustment</span><span id="lastAdjustment">...</span></div>
+            <div class="status-item"><span class="label">Tibber data age</span><span id="tibberAge">...</span></div>
+            <div class="status-item"><span class="label">Tibber API requests</span><span id="tibberApiRequests">...</span></div>
+            <div class="status-item"><span class="label">Last API request</span><span id="tibberApiLast">...</span></div>
+            <div class="status-item"><span class="label">Last API result</span><span id="tibberApiResult">...</span></div>
+        </div>
+    </section>
 
-        min="6" step="1"> A
+    <section class="panel">
+        <div class="panel-title">Configuration</div>
+        <div class="panel-body">
+            <div class="config-grid">
+                <label for="enabled">Enabled</label>
+                <input id="enabled" type="checkbox">
 
+                <label for="mode">Mode</label>
+                <select id="mode">
+                    <option value="automatic">Automatic</option>
+                    <option value="safe">Safe</option>
+                    <option value="manual">Manual</option>
+                </select>
+
+                <label for="hourlyLimit">Hourly grid limit</label>
+                <div><input id="hourlyLimit" type="number" min="0.1" step="0.01"> kWh</div>
+
+                <label for="safeCurrent">Safe/default current</label>
+                <div><input id="safeCurrent" type="number" min="6" step="1"> A</div>
+
+                <label for="minimumCurrent">Minimum current</label>
+                <div><input id="minimumCurrent" type="number" min="6" step="1"> A</div>
+
+                <label for="maximumCurrent">Maximum CENTRAL100 current</label>
+                <div><input id="maximumCurrent" type="number" min="6" step="1"> A</div>
+
+                <label for="manualCurrent">Manual current</label>
+                <div><input id="manualCurrent" type="number" min="6" step="1"> A</div>
+
+                <label for="tibberTimeout">Tibber stale timeout</label>
+                <div><input id="tibberTimeout" type="number" min="5" step="1"> s</div>
+
+                <label for="controlInterval">Control interval</label>
+                <div><input id="controlInterval" type="number" min="5" step="1"> s</div>
+
+                <label for="idleTimeout">Idle timeout</label>
+                <div><input id="idleTimeout" type="number" min="30" step="1"> s</div>
+
+                <label for="tibberHomeId">Tibber home ID</label>
+                <input id="tibberHomeId" type="text">
+            </div>
+
+            <div class="actions">
+                <button onclick="saveConfig()">Save configuration</button>
+                <button onclick="applySafe()">Restore safe current</button>
+            </div>
+            <div class="note">Automatic mode controls CENTRAL100 from the configured hourly grid-import limit.</div>
+        </div>
+    </section>
+
+    <section id="controlTuningPanel" class="panel advanced" hidden>
+        <div class="panel-title">Control tuning</div>
+        <div class="panel-body">
+            <div class="config-grid">
+                <label for="downDeadband">Downward deadband</label>
+                <div><input id="downDeadband" type="number" min="0" step="50"> W</div>
+
+                <label for="urgentDown">Urgent downward threshold</label>
+                <div><input id="urgentDown" type="number" min="0" step="50"> W</div>
+
+                <label for="onePhaseGate">1-phase upward gate</label>
+                <div><input id="onePhaseGate" type="number" min="0" step="50"> W</div>
+
+                <label for="onePhaseTwoAmp">1-phase +2 A threshold</label>
+                <div><input id="onePhaseTwoAmp" type="number" min="0" step="50"> W</div>
+
+                <label for="onePhaseCalculated">1-phase calculated threshold</label>
+                <div><input id="onePhaseCalculated" type="number" min="0" step="50"> W</div>
+
+                <label for="onePhaseMaxStep">1-phase calculated max step</label>
+                <div><input id="onePhaseMaxStep" type="number" min="1" max="32" step="1"> A</div>
+
+                <label for="onePhaseWattsPerAmp">1-phase watts per amp</label>
+                <div><input id="onePhaseWattsPerAmp" type="number" min="1" step="1"> W/A</div>
+
+                <label for="multiPhaseGate">3-phase/mixed upward gate</label>
+                <div><input id="multiPhaseGate" type="number" min="0" step="50"> W</div>
+
+                <label for="multiPhaseTwoAmp">3-phase/mixed +2 A threshold</label>
+                <div><input id="multiPhaseTwoAmp" type="number" min="0" step="50"> W</div>
+
+                <label for="multiPhaseCalculated">3-phase/mixed calculated threshold</label>
+                <div><input id="multiPhaseCalculated" type="number" min="0" step="50"> W</div>
+
+                <label for="multiPhaseMaxStep">3-phase/mixed calculated max step</label>
+                <div><input id="multiPhaseMaxStep" type="number" min="1" max="32" step="1"> A</div>
+
+                <label for="multiPhaseWattsPerAmp">3-phase/mixed watts per amp</label>
+                <div><input id="multiPhaseWattsPerAmp" type="number" min="1" step="1"> W/A</div>
+
+                <label for="calculatedReserve">Calculated increase reserve</label>
+                <div><input id="calculatedReserve" type="number" min="0" step="50"> W</div>
+
+                <label for="normalDwell">Normal dwell</label>
+                <div><input id="normalDwell" type="number" min="0" step="1"> s</div>
+
+                <label for="midUpDwell">Mid upward dwell</label>
+                <div><input id="midUpDwell" type="number" min="0" step="1"> s</div>
+
+                <label for="nearUpDwell">Near-target upward dwell</label>
+                <div><input id="nearUpDwell" type="number" min="0" step="1"> s</div>
+
+                <label for="unusedDlmHeadroom">Unused DLM headroom threshold</label>
+                <div><input id="unusedDlmHeadroom" type="number" min="0" step="0.1"> A</div>
+            </div>
+            <div class="actions">
+                <button onclick="saveConfig()">Save configuration</button>
+            </div>
+        </div>
+    </section>
+
+    <p id="message"></p>
+    <p id="error"></p>
 </div>
-
-
-
-<label for="minimumCurrent">Minimum current</label>
-
-<div>
-
-    <input id="minimumCurrent" type="number"
-
-        min="6" step="1"> A
-
-</div>
-
-
-
-<label for="maximumCurrent">Maximum CENTRAL100 current</label>
-
-<div>
-
-    <input id="maximumCurrent" type="number"
-
-        min="6" step="1"> A
-
-</div>
-
-
-
-<label for="manualCurrent">Manual current</label>
-
-<div>
-
-    <input id="manualCurrent" type="number"
-
-        min="6" step="1"> A
-
-</div>
-
-
-
-<label for="tibberTimeout">Tibber stale timeout</label>
-
-<div>
-
-    <input id="tibberTimeout" type="number"
-
-        min="5" step="1"> s
-
-</div>
-
-
-
-<label for="controlInterval">Control interval</label>
-
-<div>
-
-    <input id="controlInterval" type="number"
-
-        min="5" step="1"> s
-
-</div>
-
-
-
-<label for="idleTimeout">Idle timeout</label>
-
-<div>
-
-    <input id="idleTimeout" type="number"
-
-        min="30" step="1"> s
-
-</div>
-
-<label for="tibberHomeId">Tibber home ID</label>
-
-<div>
-
-    <input id="tibberHomeId" type="text">
-
-</div>
-
-</div>
-
-<h2>Control tuning</h2>
-
-<div class="config-grid">
-
-<label for="downDeadband">Downward deadband</label>
-<div><input id="downDeadband" type="number" min="0" step="50"> W</div>
-
-<label for="urgentDown">Urgent downward threshold</label>
-<div><input id="urgentDown" type="number" min="0" step="50"> W</div>
-
-<label for="onePhaseGate">1-phase upward gate</label>
-<div><input id="onePhaseGate" type="number" min="0" step="50"> W</div>
-
-<label for="onePhaseTwoAmp">1-phase +2 A threshold</label>
-<div><input id="onePhaseTwoAmp" type="number" min="0" step="50"> W</div>
-
-<label for="onePhaseCalculated">1-phase calculated threshold</label>
-<div><input id="onePhaseCalculated" type="number" min="0" step="50"> W</div>
-
-<label for="onePhaseMaxStep">1-phase calculated max step</label>
-<div><input id="onePhaseMaxStep" type="number" min="1" max="32" step="1"> A</div>
-
-<label for="onePhaseWattsPerAmp">1-phase watts per amp</label>
-<div><input id="onePhaseWattsPerAmp" type="number" min="1" step="1"> W/A</div>
-
-<label for="multiPhaseGate">3-phase/mixed upward gate</label>
-<div><input id="multiPhaseGate" type="number" min="0" step="50"> W</div>
-
-<label for="multiPhaseTwoAmp">3-phase/mixed +2 A threshold</label>
-<div><input id="multiPhaseTwoAmp" type="number" min="0" step="50"> W</div>
-
-<label for="multiPhaseCalculated">3-phase/mixed calculated threshold</label>
-<div><input id="multiPhaseCalculated" type="number" min="0" step="50"> W</div>
-
-<label for="multiPhaseMaxStep">3-phase/mixed calculated max step</label>
-<div><input id="multiPhaseMaxStep" type="number" min="1" max="32" step="1"> A</div>
-
-<label for="multiPhaseWattsPerAmp">3-phase/mixed watts per amp</label>
-<div><input id="multiPhaseWattsPerAmp" type="number" min="1" step="1"> W/A</div>
-
-<label for="calculatedReserve">Calculated increase reserve</label>
-<div><input id="calculatedReserve" type="number" min="0" step="50"> W</div>
-
-<label for="normalDwell">Normal dwell</label>
-<div><input id="normalDwell" type="number" min="0" step="1"> s</div>
-
-<label for="midUpDwell">Mid upward dwell</label>
-<div><input id="midUpDwell" type="number" min="0" step="1"> s</div>
-
-<label for="nearUpDwell">Near-target upward dwell</label>
-<div><input id="nearUpDwell" type="number" min="0" step="1"> s</div>
-
-<label for="unusedDlmHeadroom">Unused DLM headroom threshold</label>
-<div><input id="unusedDlmHeadroom" type="number" min="0" step="0.1"> A</div>
-
-</div>
-
-
-
-<p>
-
-<button onclick="saveConfig()">Save configuration</button>
-
-<button onclick="applySafe()">Restore safe current</button>
-
-</p>
-
-
-
-<p class="note">
-
-Automatic mode controls CENTRAL100 from the configured hourly grid-import limit.
-
-Saving settings while already in Automatic mode does not reset the DLM current.
-
-</p>
-
-
-
-<p id="message"></p>
-
-<p id="error"></p>
-
-
 
 <script>
-
-
-
-async function refreshStatus() {
-
-    try {
-
-        const r = await fetch("/api/status");
-
-        const s = await r.json();
-
-
-
-        document.getElementById("garo").textContent =
-
-            s.garo_online ? "Online" : "Offline";
-
-
-
-        document.getElementById("fuse100").textContent =
-
-            s.load_balancing_fuse !== undefined
-
-                ? s.load_balancing_fuse + " A"
-
-                : "-";
-
-
-
-        document.getElementById("fuse101").textContent =
-
-            s.load_balancing_fuse_101 !== undefined
-
-                ? s.load_balancing_fuse_101 + " A"
-
-                : "-";
-
-
-
-        document.getElementById("controllerStatus").textContent =
-
-            s.enabled
-
-                ? s.mode
-
-                : "Disabled";
-
-
-
-        const t = s.tibber || {};
-
-        document.getElementById("tibberApiRequests").textContent =
-
-            t.api_request_count ?? 0;
-
-
-
-        document.getElementById("tibberApiLast").textContent =
-
-            t.last_api_request
-
-                ? t.last_api_request_age_seconds + " s ago"
-
-                : "-";
-
-
-
-        document.getElementById("tibberApiResult").textContent =
-
-            t.last_api_result || "-";
-
-
-
-
-
-        document.getElementById("tibber").textContent =
-
-            !t.configured
-
-                ? "Not configured"
-
-                : t.connected
-
-                    ? "Connected"
-
-                    : "Disconnected";
-
-
-
-        document.getElementById("tibberHome").textContent =
-
-            t.home_name || t.home_id || "-";
-
-
-
-        document.getElementById("tibberPower").textContent =
-
-            t.connected
-
-                ? Math.round(t.power_w) + " W"
-
-                : "-";
-
-
-
-        document.getElementById("tibberProduction").textContent =
-
-            t.connected
-
-                ? Math.round(t.power_production_w) + " W"
-
-                : "-";
-
-
-
-        document.getElementById("tibberHour").textContent =
-
-            t.last_update
-
-                ? t.accumulated_consumption_last_hour_kwh.toFixed(3) + " kWh"
-
-                : "-";
-
-
-
-        document.getElementById("tibberAge").textContent =
-
-            t.last_update
-
-                ? t.age_seconds + " s"
-
-                : "-";
-
-
-
-        if (t.error) {
-
-            document.getElementById("error").textContent =
-
-                "Tibber: " + t.error;
-
-        } else {
-
-            document.getElementById("error").textContent =
-
-                s.error || "";
-
-        }
-
-
-
-        const c = s.controller || {};
-
-
-
-
-
-        document.getElementById("central100Current").textContent =
-
-            c.central100_phase1_a !== undefined
-
-                ? c.central100_phase1_a.toFixed(1) + " / " +
-
-                c.central100_phase2_a.toFixed(1) + " / " +
-
-                c.central100_phase3_a.toFixed(1) + " A"
-
-                : "-";
-
-
-
-        document.getElementById("central101Current").textContent =
-
-            c.central101_phase1_a !== undefined
-
-                ? c.central101_phase1_a.toFixed(1) + " / " +
-
-                c.central101_phase2_a.toFixed(1) + " / " +
-
-                c.central101_phase3_a.toFixed(1) + " A"
-
-                : "-";
-
-
-
-        document.getElementById("charging").textContent =
-
-            c.charging ? "Yes" : "No";
-
-        document.getElementById("phaseMode").textContent =
-            c.phase_mode || "-";
-
-        document.getElementById("powerHeadroom").textContent =
-            c.energy_valid
-                ? Math.round(c.power_headroom_w) + " W"
-                : "-";
-
-        document.getElementById("dlmHeadroom").textContent =
-            c.dlm_headroom_a !== undefined
-                ? c.dlm_headroom_a.toFixed(1) + " A"
-                : "-";
-
-        document.getElementById("lastAdjustment").textContent =
-            c.last_adjustment_age_seconds !== undefined
-                ? c.last_adjustment_age_seconds + " s ago"
-                : "-";
-
-
-
-        document.getElementById("controlSource").textContent =
-
-            c.source || "-";
-
-
-
-        document.getElementById("hourEnergy").textContent =
-
-            c.energy_valid
-
-                ? c.hour_energy_kwh.toFixed(3) + " kWh"
-
-                : "-";
-
-
-
-        document.getElementById("remainingEnergy").textContent =
-
-            c.energy_valid
-
-                ? c.remaining_energy_kwh.toFixed(3) + " kWh"
-
-                : "-";
-
-
-
-        document.getElementById("allowedPower").textContent =
-
-            c.energy_valid
-
-                ? Math.round(c.allowed_average_power_w) + " W"
-
-                : "-";
-
-
-
-        document.getElementById("decision").textContent =
-
-            c.decision || "-";
-
-
-
-
-
-    } catch (e) {
-
-        document.getElementById("error").textContent =
-
-            "Status request failed: " + e;
-
-    }
-
+function setText(id, value) {
+    document.getElementById(id).textContent = value;
 }
 
+function formatPhaseCurrents(c, prefix) {
+    const p1 = c[prefix + "_phase1_a"];
+    const p2 = c[prefix + "_phase2_a"];
+    const p3 = c[prefix + "_phase3_a"];
+    if (p1 === undefined || p2 === undefined || p3 === undefined) {
+        return "-";
+    }
+    return p1.toFixed(1) + " / " + p2.toFixed(1) + " / " + p3.toFixed(1) + " A";
+}
 
+async function refreshStatus() {
+    try {
+        const r = await fetch("/api/status", {cache: "no-store"});
+        const s = await r.json();
+        const t = s.tibber || {};
+        const c = s.controller || {};
+
+        setText("garo", s.garo_online ? "Online" : "Offline");
+        setText("fuse100", s.load_balancing_fuse !== undefined ? s.load_balancing_fuse + " A" : "-");
+        setText("fuse101", s.load_balancing_fuse_101 !== undefined ? s.load_balancing_fuse_101 + " A" : "-");
+        setText("controllerStatus", s.enabled ? s.mode : "Disabled");
+        setText("charging", c.charging ? "Yes" : "No");
+        setText("phaseMode", c.phase_mode || "-");
+        setText("decision", c.decision || "-");
+        setText("central100Current", formatPhaseCurrents(c, "central100"));
+        setText("central101Current", formatPhaseCurrents(c, "central101"));
+        setText("dlmHeadroom", c.dlm_headroom_a !== undefined ? c.dlm_headroom_a.toFixed(1) + " A" : "-");
+        setText("lastAdjustment", c.last_adjustment_age_seconds !== undefined ? c.last_adjustment_age_seconds + " s ago" : "-");
+        setText("powerHeadroom", c.energy_valid ? Math.round(c.power_headroom_w) + " W" : "-");
+        setText("controlSource", c.source || "-");
+        setText("hourEnergy", c.energy_valid ? c.hour_energy_kwh.toFixed(3) + " kWh" : "-");
+        setText("remainingEnergy", c.energy_valid ? c.remaining_energy_kwh.toFixed(3) + " kWh" : "-");
+        setText("allowedPower", c.energy_valid ? Math.round(c.allowed_average_power_w) + " W" : "-");
+
+        setText("tibber", !t.configured ? "Not configured" : (t.connected ? "Connected" : "Disconnected"));
+        setText("tibberHome", t.home_name || t.home_id || "-");
+        setText("tibberPower", t.connected ? Math.round(t.power_w) + " W" : "-");
+        setText("tibberProduction", t.connected ? Math.round(t.power_production_w) + " W" : "-");
+        setText("tibberHour", t.last_update ? t.accumulated_consumption_last_hour_kwh.toFixed(3) + " kWh" : "-");
+        setText("tibberAge", t.last_update ? t.age_seconds + " s" : "-");
+        setText("tibberApiRequests", t.api_request_count ?? 0);
+        setText("tibberApiLast", t.last_api_request ? t.last_api_request_age_seconds + " s ago" : "-");
+        setText("tibberApiResult", t.last_api_result || "-");
+
+        const modeText = s.enabled ? s.mode.charAt(0).toUpperCase() + s.mode.slice(1) : "Disabled";
+        setText("topStatus", modeText + (c.charging ? " - Charging" : " - Not charging"));
+
+        if (t.error) {
+            setText("error", "Tibber: " + t.error);
+        } else {
+            setText("error", s.error || "");
+        }
+    } catch (e) {
+        setText("error", "Status request failed: " + e);
+    }
+}
 
 async function loadConfiguration() {
-
     try {
-
-        const r = await fetch("/api/config");
-
-
-
+        const r = await fetch("/api/config", {cache: "no-store"});
         if (!r.ok) {
-
             throw new Error(await r.text());
-
         }
 
-
-
         const c = await r.json();
-
-
-
-        document.getElementById("enabled").checked =
-
-            c.enabled;
-
-
-
-        document.getElementById("mode").value =
-
-            c.mode;
-
-
-
-        document.getElementById("hourlyLimit").value =
-
-            c.hourly_limit_kwh;
-
-
-
-        document.getElementById("safeCurrent").value =
-
-            c.safe_current_a;
-
-
-
-        document.getElementById("minimumCurrent").value =
-
-            c.minimum_current_a;
-
-
-
-        document.getElementById("maximumCurrent").value =
-
-            c.maximum_current_a;
-
-
-
-        document.getElementById("manualCurrent").value =
-
-            c.manual_current_a;
-
-
-
-        document.getElementById("tibberTimeout").value =
-
-            c.tibber_timeout_seconds;
-
-
-
-        document.getElementById("controlInterval").value =
-
-            c.control_interval_seconds;
-
-
-
-        document.getElementById("idleTimeout").value =
-
-            c.idle_timeout_seconds;
-
-
-
-        document.getElementById("tibberHomeId").value =
-
-            c.tibber_home_id || "";
+        document.getElementById("enabled").checked = c.enabled;
+        document.getElementById("mode").value = c.mode;
+        document.getElementById("hourlyLimit").value = c.hourly_limit_kwh;
+        document.getElementById("safeCurrent").value = c.safe_current_a;
+        document.getElementById("minimumCurrent").value = c.minimum_current_a;
+        document.getElementById("maximumCurrent").value = c.maximum_current_a;
+        document.getElementById("manualCurrent").value = c.manual_current_a;
+        document.getElementById("tibberTimeout").value = c.tibber_timeout_seconds;
+        document.getElementById("controlInterval").value = c.control_interval_seconds;
+        document.getElementById("idleTimeout").value = c.idle_timeout_seconds;
+        document.getElementById("tibberHomeId").value = c.tibber_home_id || "";
 
         const t = c.control_tuning || {};
-
         document.getElementById("downDeadband").value = t.down_deadband_w;
         document.getElementById("urgentDown").value = t.urgent_down_w;
         document.getElementById("onePhaseGate").value = t.one_phase_up_gate_w;
@@ -1497,93 +1027,27 @@ async function loadConfiguration() {
         document.getElementById("midUpDwell").value = t.mid_up_dwell_seconds;
         document.getElementById("nearUpDwell").value = t.near_up_dwell_seconds;
         document.getElementById("unusedDlmHeadroom").value = t.unused_dlm_headroom_a;
-
     } catch (e) {
-
-        document.getElementById("error").textContent =
-
-            "Configuration request failed: " + e;
-
+        setText("error", "Configuration request failed: " + e);
     }
-
 }
 
-
-
 async function saveConfig() {
-
-    document.getElementById("message").textContent = "";
-
-    document.getElementById("error").textContent = "";
-
-
+    setText("message", "");
+    setText("error", "");
 
     const config = {
-
-        enabled:
-
-            document.getElementById("enabled").checked,
-
-
-
-        mode:
-
-            document.getElementById("mode").value,
-
-
-
-        hourly_limit_kwh:
-
-            Number(document.getElementById("hourlyLimit").value),
-
-
-
-        safe_current_a:
-
-            Number(document.getElementById("safeCurrent").value),
-
-
-
-        minimum_current_a:
-
-            Number(document.getElementById("minimumCurrent").value),
-
-
-
-        maximum_current_a:
-
-            Number(document.getElementById("maximumCurrent").value),
-
-
-
-        manual_current_a:
-
-            Number(document.getElementById("manualCurrent").value),
-
-
-
-        tibber_timeout_seconds:
-
-            Number(document.getElementById("tibberTimeout").value),
-
-
-
-        control_interval_seconds:
-
-            Number(document.getElementById("controlInterval").value),
-
-
-
-        idle_timeout_seconds:
-
-            Number(document.getElementById("idleTimeout").value),
-
-
-
-        tibber_home_id:
-
-            document.getElementById("tibberHomeId").value.trim(),
-
+        enabled: document.getElementById("enabled").checked,
+        mode: document.getElementById("mode").value,
+        hourly_limit_kwh: Number(document.getElementById("hourlyLimit").value),
+        safe_current_a: Number(document.getElementById("safeCurrent").value),
+        minimum_current_a: Number(document.getElementById("minimumCurrent").value),
+        maximum_current_a: Number(document.getElementById("maximumCurrent").value),
+        manual_current_a: Number(document.getElementById("manualCurrent").value),
+        tibber_timeout_seconds: Number(document.getElementById("tibberTimeout").value),
+        control_interval_seconds: Number(document.getElementById("controlInterval").value),
+        idle_timeout_seconds: Number(document.getElementById("idleTimeout").value),
+        tibber_home_id: document.getElementById("tibberHomeId").value.trim(),
         control_tuning: {
             down_deadband_w: Number(document.getElementById("downDeadband").value),
             urgent_down_w: Number(document.getElementById("urgentDown").value),
@@ -1603,121 +1067,56 @@ async function saveConfig() {
             near_up_dwell_seconds: Number(document.getElementById("nearUpDwell").value),
             unused_dlm_headroom_a: Number(document.getElementById("unusedDlmHeadroom").value)
         }
-
     };
 
-
-
     const r = await fetch("/api/config", {
-
         method: "POST",
-
-        headers: {
-
-            "Content-Type": "application/json"
-
-        },
-
+        headers: {"Content-Type": "application/json"},
         body: JSON.stringify(config)
-
     });
 
-
-
     if (!r.ok) {
-
-        document.getElementById("error").textContent =
-
-            await r.text();
-
+        setText("error", await r.text());
         return;
-
     }
-
-
 
     const result = await r.json();
-
-
-
     if (result.warning) {
-
-        document.getElementById("error").textContent =
-
-            result.warning;
-
+        setText("error", result.warning);
     }
 
-
-
-    document.getElementById("message").textContent =
-
-        result.saved
-
-            ? "Configuration saved."
-
-            : "Configuration unchanged.";
-
-
-
+    setText("message", result.saved ? "Configuration saved." : "Configuration unchanged.");
     await refreshStatus();
-
 }
-
-
 
 async function applySafe() {
+    setText("message", "");
+    setText("error", "");
 
-    document.getElementById("message").textContent = "";
-
-    document.getElementById("error").textContent = "";
-
-
-
-    const r = await fetch("/api/safe", {
-
-        method: "POST"
-
-    });
-
-
-
+    const r = await fetch("/api/safe", {method: "POST"});
     if (!r.ok) {
-
-        document.getElementById("error").textContent =
-
-            await r.text();
-
+        setText("error", await r.text());
         return;
-
     }
 
-
-
-    document.getElementById("message").textContent =
-
-        "Safe current applied.";
-
-
-
+    setText("message", "Safe current applied.");
     await refreshStatus();
-
 }
 
+document.getElementById("garoLogo").addEventListener("dblclick", function () {
+    const panel = document.getElementById("controlTuningPanel");
+    panel.hidden = !panel.hidden;
+});
 
+document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") {
+        document.getElementById("controlTuningPanel").hidden = true;
+    }
+});
 
 loadConfiguration();
-
 refreshStatus();
-
 setInterval(refreshStatus, 5000);
-
-
-
 </script>
-
-
-
 </body>
-
 </html>`
