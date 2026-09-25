@@ -31,8 +31,10 @@ const (
 
 	garoBaseURL = "http://127.0.0.1:8080/servlet/rest/chargebox"
 
-	garoStableImageDir   = "/var/lib/tomcat8/webapps/serialweb/images"
-	garoFallbackImageDir = "/tmp/serialwebapp/webapp/images"
+	garoStableImageDir    = "/var/lib/tomcat8/webapps/serialweb/images"
+	garoFallbackImageDir  = "/tmp/serialwebapp/webapp/images"
+	garoStableJQueryDir   = "/var/lib/tomcat8/webapps/serialweb/jquery"
+	garoFallbackJQueryDir = "/tmp/serialwebapp/webapp/jquery"
 )
 
 type GaroClient struct {
@@ -106,83 +108,112 @@ func (g *GaroClient) GetLBConfig() (map[string]json.RawMessage, error) {
 
 }
 
-func (g *GaroClient) SetLoadBalancingFuse(currentA int) error {
-
+func (g *GaroClient) setLoadBalancingCurrent(field string, currentA int) error {
 	g.mu.Lock()
-
 	defer g.mu.Unlock()
 
+	switch field {
+	case "loadBalancingFuse", "loadBalancingFuse101":
+	default:
+		return fmt.Errorf("unsupported load-balancing current field %q", field)
+	}
+
 	// Always fetch the complete current GARO configuration first.
-
 	cfg, err := g.getLBConfig()
-
 	if err != nil {
-
 		return err
+	}
 
+	// Avoid even a no-op POST when the current GARO value already matches.
+	if existing := rawInt(cfg[field]); existing != nil && *existing == currentA {
+		return nil
 	}
 
 	// The GARO servlet updates Derby client-box rows whenever a slaves array is
 	// included in the POST. The charger accepts the same top-level load-balancing
 	// configuration without that array, avoiding persistent SD-card writes for
-	// ordinary DLM100 adjustments.
+	// ordinary DLM current adjustments.
 	delete(cfg, "slaves")
-
-	// Modify only CENTRAL100.
-	cfg["loadBalancingFuse"] = json.RawMessage(strconv.Itoa(currentA))
+	cfg[field] = json.RawMessage(strconv.Itoa(currentA))
 
 	payload, err := json.Marshal(cfg)
-
 	if err != nil {
-
 		return err
-
 	}
 
 	req, err := http.NewRequest(
-
 		http.MethodPost,
-
 		g.baseURL+"/lbconfig",
-
 		bytes.NewReader(payload),
 	)
-
 	if err != nil {
-
 		return err
-
 	}
 
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-
 	resp, err := g.client.Do(req)
-
 	if err != nil {
-
 		return err
-
 	}
-
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-
 		return fmt.Errorf(
-
 			"POST lbconfig: HTTP %d: %s",
-
 			resp.StatusCode,
-
 			string(body),
 		)
-
 	}
 
 	return nil
+}
 
+func (g *GaroClient) SetLoadBalancingFuse(currentA int) error {
+	return g.setLoadBalancingCurrent("loadBalancingFuse", currentA)
+}
+
+func (g *GaroClient) SetLoadBalancingFuse101(currentA int) error {
+	return g.setLoadBalancingCurrent("loadBalancingFuse101", currentA)
+}
+
+func (g *GaroClient) SetChargeMode(mode string) error {
+	switch mode {
+	case "ALWAYS_ON", "ALWAYS_OFF", "SCHEMA":
+	default:
+		return fmt.Errorf("unsupported GARO charge mode %q", mode)
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	req, err := http.NewRequest(
+		http.MethodPost,
+		g.baseURL+"/mode/"+mode,
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf(
+			"POST mode/%s: HTTP %d: %s",
+			mode,
+			resp.StatusCode,
+			string(body),
+		)
+	}
+
+	return nil
 }
 
 func rawInt(v json.RawMessage) *int {
@@ -212,6 +243,12 @@ type Status struct {
 
 	LoadBalancingFuse101 *int `json:"load_balancing_fuse_101,omitempty"`
 
+	ChargeMode           string `json:"charge_mode,omitempty"`
+	ChargeModeValid      bool   `json:"charge_mode_valid"`
+	ChargeModeAgeSeconds int64  `json:"charge_mode_age_seconds,omitempty"`
+	ChargeModeStale      bool   `json:"charge_mode_stale"`
+	ChargeModeError      string `json:"charge_mode_error,omitempty"`
+
 	Enabled bool `json:"enabled"`
 
 	Mode string `json:"mode"`
@@ -231,6 +268,34 @@ type SaveResponse struct {
 	Saved bool `json:"saved"`
 
 	Warning string `json:"warning,omitempty"`
+}
+
+func appendWarning(response *SaveResponse, warning string) {
+	if warning == "" {
+		return
+	}
+	if response.Warning == "" {
+		response.Warning = warning
+		return
+	}
+	response.Warning += "; " + warning
+}
+
+func ensureLoadBalancingFuse101(
+	cfg Config,
+	garo *GaroClient,
+	garoCache *GaroCache,
+) error {
+	state := garoCache.Snapshot(time.Now())
+	if state.LBValid && state.LoadBalancingFuse101 == cfg.LoadBalancingFuse101A {
+		return nil
+	}
+
+	if err := garo.SetLoadBalancingFuse101(cfg.LoadBalancingFuse101A); err != nil {
+		return err
+	}
+	garoCache.NoteLoadBalancingFuse101(cfg.LoadBalancingFuse101A)
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, value any) {
@@ -283,6 +348,20 @@ func findGaroImageDir() string {
 	for _, candidate := range []string{
 		garoStableImageDir,
 		garoFallbackImageDir,
+	} {
+		info, err := os.Stat(candidate)
+		if err == nil && info.IsDir() {
+			return candidate
+		}
+	}
+
+	return ""
+}
+
+func findGaroJQueryDir() string {
+	for _, candidate := range []string{
+		garoStableJQueryDir,
+		garoFallbackJQueryDir,
 	} {
 		info, err := os.Stat(candidate)
 		if err == nil && info.IsDir() {
@@ -371,6 +450,9 @@ func main() {
 	// Prime in-memory values before the controller starts. Browser status
 	// requests read this cache and never call the GARO API directly.
 	garoCache.RefreshFast(garo)
+	if err := ensureLoadBalancingFuse101(cfg, garo, garoCache); err != nil {
+		log.Printf("warning: could not apply configured CENTRAL101 limit: %v", err)
+	}
 	go garoCache.RunFast(context.Background(), garo)
 
 	tibber := NewTibberClient(secrets.TibberToken)
@@ -408,6 +490,19 @@ func main() {
 		log.Printf("warning: GARO interface image directory not found")
 	}
 
+	if jqueryDir := findGaroJQueryDir(); jqueryDir != "" {
+		log.Printf("serving GARO jQuery Mobile icon CSS from %s", jqueryDir)
+		http.Handle(
+			"/garo-jquery/",
+			http.StripPrefix(
+				"/garo-jquery/",
+				http.FileServer(http.Dir(jqueryDir)),
+			),
+		)
+	} else {
+		log.Printf("warning: GARO jQuery directory not found")
+	}
+
 	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		cfg := store.Get()
 		garoState := garoCache.Snapshot(time.Now())
@@ -415,12 +510,17 @@ func main() {
 		mergeGaroDiagnostics(&controllerStatus, garoState)
 
 		status := Status{
-			GAROOnline:   garoState.Online,
-			Enabled:      cfg.Enabled,
-			Mode:         cfg.Mode,
-			SafeCurrentA: cfg.SafeCurrentA,
-			Tibber:       tibber.Snapshot(),
-			Controller:   controllerStatus,
+			GAROOnline:           garoState.Online,
+			ChargeMode:           garoState.ChargeMode,
+			ChargeModeValid:      garoState.ChargeModeValid,
+			ChargeModeAgeSeconds: garoState.ChargeModeAgeSeconds,
+			ChargeModeStale:      garoState.ChargeModeStale,
+			ChargeModeError:      garoState.ChargeModeError,
+			Enabled:              cfg.Enabled,
+			Mode:                 cfg.Mode,
+			SafeCurrentA:         cfg.SafeCurrentA,
+			Tibber:               tibber.Snapshot(),
+			Controller:           controllerStatus,
 		}
 
 		if garoState.LBValid {
@@ -501,6 +601,15 @@ func main() {
 				Saved: saved,
 			}
 
+			// CENTRAL101 is a fixed charger-subfeed ceiling. The setter uses the
+			// tested no-slaves lbconfig payload, avoiding Derby slave-row writes.
+			if err := ensureLoadBalancingFuse101(newCfg, garo, garoCache); err != nil {
+				appendWarning(
+					&response,
+					"Configuration saved, but CENTRAL101 update failed: "+err.Error(),
+				)
+			}
+
 			// Do not reset DLM100 to SafeCurrentA when changing settings while
 			// automatic control is already active. The controller will use the
 			// new configuration on its next control cycle.
@@ -511,13 +620,10 @@ func main() {
 
 			if shouldApplyMode {
 				if err := applyMode(newCfg, garo); err != nil {
-
-					response.Warning =
-
-						"Configuration saved, but GARO update failed: " +
-
-							err.Error()
-
+					appendWarning(
+						&response,
+						"Configuration saved, but GARO update failed: "+err.Error(),
+					)
 				}
 			}
 
@@ -559,6 +665,7 @@ func main() {
 			return
 
 		}
+		garoCache.NoteLoadBalancingFuse(cfg.SafeCurrentA)
 
 		writeJSON(w, map[string]any{
 
@@ -569,20 +676,51 @@ func main() {
 
 	})
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-
-		if r.URL.Path != "/" {
-
-			http.NotFound(w, r)
-
+	http.HandleFunc("/api/charge-mode", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", http.StatusMethodNotAllowed)
 			return
-
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, 4*1024)
+		var request struct {
+			Mode string `json:"mode"`
+		}
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			http.Error(w, "invalid charge mode: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if err := garo.SetChargeMode(request.Mode); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		garoCache.NoteChargeMode(request.Mode)
+
+		writeJSON(w, map[string]any{
+			"ok":   true,
+			"mode": request.Mode,
+		})
+	})
+
+	http.HandleFunc("/settings", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/settings" {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, settingsPage)
+	})
 
-		io.WriteString(w, page)
-
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, statusPage)
 	})
 
 	log.Printf("GARO Energy Controller starting on %s", listenAddress)
@@ -595,13 +733,7 @@ func main() {
 
 }
 
-const page = `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GARO Energy Controller</title>
-<style>
+const pageCSS = `
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
 body {
@@ -614,12 +746,45 @@ body {
     height: 46px;
     background: #e9e9e9;
     border-bottom: 1px solid #d5d5d5;
+    position: relative;
     display: flex;
     align-items: center;
-    justify-content: flex-end;
-    padding: 0 18px;
+    justify-content: center;
     color: #444;
     font-size: 13px;
+}
+.garo-icon-button {
+    position: absolute;
+    left: 8px;
+    top: 8px;
+    display: block;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    overflow: hidden;
+    text-indent: -9999px;
+    white-space: nowrap;
+    border: 1px solid #c8c8c8;
+    border-radius: 16px;
+    background: linear-gradient(#fff, #ededed);
+    box-shadow: 0 1px 2px rgba(0,0,0,.18);
+}
+.garo-icon-button:hover { background: #f4f4f4; }
+.garo-icon-button:after {
+    content: "";
+    position: absolute;
+    display: block;
+    width: 22px;
+    height: 22px;
+    left: 50%;
+    top: 50%;
+    margin-left: -11px;
+    margin-top: -11px;
+    background-color: #777;
+    background-color: rgba(0,0,0,.42);
+    background-position: center center;
+    background-repeat: no-repeat;
+    border-radius: 12px;
 }
 .page {
     max-width: 1200px;
@@ -729,20 +894,31 @@ button {
 }
 button:hover { background: #eee; }
 .note { color: #666; font-size: 12px; margin-top: 12px; }
+.current-value { color: #666; margin-left: 8px; font-size: 12px; }
 #message { color: #087b12; }
 #error { color: #a00; white-space: pre-wrap; }
-.advanced .panel-title { background: #f2f2f2; }
-[hidden] { display: none !important; }
 @media (max-width: 760px) {
     .status-grid { grid-template-columns: 1fr; }
     .status-item { grid-template-columns: 165px minmax(0, 1fr); }
     .config-grid { grid-template-columns: 1fr; gap: 4px; }
     .config-grid label { margin-top: 8px; }
 }
-</style>
+`
+
+const statusPage = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GARO Energy Controller</title>
+<link rel="stylesheet" href="/garo-jquery/jquery.mobile.icons.min.css">
+<style>` + pageCSS + `</style>
 </head>
 <body>
 <div class="topbar">
+    <a href="/settings" class="garo-icon-button ui-icon-gear"
+       data-role="button" data-icon="gear" data-mini="true" data-iconpos="notext"
+       aria-label="Settings">Settings</a>
     <span>GARO Energy Controller</span>
 </div>
 
@@ -760,6 +936,7 @@ button:hover { background: #eee; }
             <div>
                 <div class="device-name">Energy controller</div>
                 <div class="data-line"><span class="data-label">Mode:</span> <span id="controllerStatus">...</span></div>
+                <div class="data-line"><span class="data-label">Charging availability:</span> <span id="chargeAvailability">...</span></div>
                 <div class="data-line"><span class="data-label">Charging:</span> <span id="charging">...</span></div>
                 <div class="data-line"><span class="data-label">Phase mode:</span> <span id="phaseMode">...</span></div>
                 <div class="data-line"><span class="data-label">Pilot currents:</span> <span id="pilotCurrents">...</span></div>
@@ -820,14 +997,152 @@ button:hover { background: #eee; }
         </div>
     </section>
 
+    <p id="error"></p>
+</div>
+
+<script>
+function setText(id, value) {
+    document.getElementById(id).textContent = value;
+}
+
+function staleSuffix(stale) {
+    return stale ? " (stale)" : "";
+}
+
+function formatChargeMode(mode) {
+    switch (mode) {
+    case "ALWAYS_ON": return "Available for charging";
+    case "ALWAYS_OFF": return "Not available for charging";
+    case "SCHEMA": return "Schedule";
+    default: return mode || "-";
+    }
+}
+
+function formatPhaseCurrents(c, prefix) {
+    if (!c[prefix + "_valid"]) {
+        return "-";
+    }
+    const p1 = c[prefix + "_phase1_a"];
+    const p2 = c[prefix + "_phase2_a"];
+    const p3 = c[prefix + "_phase3_a"];
+    return p1.toFixed(1) + " / " + p2.toFixed(1) + " / " + p3.toFixed(1) + " A" +
+        staleSuffix(c[prefix + "_stale"]);
+}
+
+function formatPilotCurrents(c) {
+    const pilots = c.pilot_levels || [];
+    if (!c.pilot_valid || pilots.length === 0) {
+        return "-";
+    }
+    return pilots.map(function (p) { return p.serial_number + ": " + p.pilot_a + " A"; }).join(" / ") +
+        staleSuffix(c.pilot_stale);
+}
+
+async function refreshStatus() {
+    try {
+        const r = await fetch("/api/status", {cache: "no-store"});
+        const s = await r.json();
+        const t = s.tibber || {};
+        const c = s.controller || {};
+
+        setText("garo", s.garo_online ? "Online" : "Offline");
+        setText("fuse100", s.load_balancing_fuse !== undefined ? s.load_balancing_fuse + " A" + staleSuffix(c.dlm_config_stale) : "-");
+        setText("fuse101", s.load_balancing_fuse_101 !== undefined ? s.load_balancing_fuse_101 + " A" + staleSuffix(c.dlm_config_stale) : "-");
+        setText("controllerStatus", s.enabled ? s.mode : "Disabled");
+        setText("chargeAvailability", s.charge_mode_valid ? formatChargeMode(s.charge_mode) + staleSuffix(s.charge_mode_stale) : "-");
+        setText("charging", c.central101_valid ? (c.charging ? "Yes" : "No") + staleSuffix(c.central101_stale) : "-");
+        setText("phaseMode", c.central101_valid ? (c.phase_mode || "-") + staleSuffix(c.central101_stale) : "-");
+        setText("pilotCurrents", formatPilotCurrents(c));
+        setText("calculatedDlmTarget", c.calculated_dlm_target_a ? c.calculated_dlm_target_a + " A" : "-");
+        setText("decision", c.decision || "-");
+        setText("central100Current", formatPhaseCurrents(c, "central100"));
+        setText("central101Current", formatPhaseCurrents(c, "central101"));
+        setText("dlmHeadroom", c.central100_valid && c.dlm_config_valid ? c.dlm_headroom_a.toFixed(1) + " A" + staleSuffix(c.central100_stale || c.dlm_config_stale) : "-");
+        setText("lastAdjustment", c.last_adjustment_age_seconds !== undefined ? c.last_adjustment_age_seconds + " s ago" : "-");
+        setText("powerHeadroom", c.energy_valid ? Math.round(c.power_headroom_w) + " W" : "-");
+        setText("controlSource", c.source || "-");
+        setText("hourEnergy", c.energy_valid ? c.hour_energy_kwh.toFixed(3) + " kWh" : "-");
+        setText("expectedHourEnergy", c.energy_valid ? c.expected_hour_energy_kwh.toFixed(3) + " kWh" : "-");
+        setText("pacingError", c.energy_valid ? (c.energy_pacing_error_kwh >= 0 ? "+" : "") + c.energy_pacing_error_kwh.toFixed(3) + " kWh" : "-");
+        setText("remainingEnergy", c.energy_valid ? c.remaining_energy_kwh.toFixed(3) + " kWh" : "-");
+        setText("baseTargetPower", c.energy_valid ? Math.round(c.base_target_power_w) + " W" : "-");
+        setText("pacingCorrection", c.energy_valid ? (c.pacing_correction_w >= 0 ? "+" : "") + Math.round(c.pacing_correction_w) + " W" : "-");
+        setText("pacingTarget", c.energy_valid ? Math.round(c.pacing_target_power_w) + " W" : "-");
+        setText("hardBudgetCeiling", c.energy_valid ? Math.round(c.hard_budget_ceiling_w) + " W" : "-");
+        setText("allowedPower", c.energy_valid ? Math.round(c.effective_target_power_w) + " W" : "-");
+
+        setText("tibber", !t.configured ? "Not configured" : (t.connected ? "Connected" : "Disconnected"));
+        setText("tibberHome", t.home_name || t.home_id || "-");
+        setText("tibberPower", t.connected ? Math.round(t.power_w) + " W" : "-");
+        setText("tibberProduction", t.connected ? Math.round(t.power_production_w) + " W" : "-");
+        setText("tibberHour", t.last_update ? t.accumulated_consumption_last_hour_kwh.toFixed(3) + " kWh" : "-");
+        setText("tibberAge", t.last_update ? t.age_seconds + " s" : "-");
+        setText("tibberApiRequests", t.api_request_count ?? 0);
+        setText("tibberApiLast", t.last_api_request ? t.last_api_request_age_seconds + " s ago" : "-");
+        setText("tibberApiResult", t.last_api_result || "-");
+
+        const modeText = s.enabled ? s.mode.charAt(0).toUpperCase() + s.mode.slice(1) : "Disabled";
+        const chargeText = c.central101_valid ? (c.charging ? " - Charging" : " - Not charging") + staleSuffix(c.central101_stale) : " - Charge state unavailable";
+        setText("topStatus", modeText + chargeText);
+
+        if (t.error) {
+            setText("error", "Tibber: " + t.error);
+        } else {
+            setText("error", s.error || "");
+        }
+    } catch (e) {
+        setText("error", "Status request failed: " + e);
+    }
+}
+
+refreshStatus();
+setInterval(refreshStatus, 5000);
+</script>
+</body>
+</html>`
+
+const settingsPage = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GARO Energy Controller - Settings</title>
+<link rel="stylesheet" href="/garo-jquery/jquery.mobile.icons.min.css">
+<style>` + pageCSS + `</style>
+</head>
+<body>
+<div class="topbar">
+    <a href="/" class="garo-icon-button ui-icon-home"
+       data-role="button" data-icon="home" data-mini="true" data-iconpos="notext"
+       aria-label="Home">Home</a>
+    <span>Settings</span>
+</div>
+
+<div class="page">
+    <div class="logo-wrap">
+        <img id="garoLogo" src="/garo-assets/garologo.png" alt="GARO">
+    </div>
+
+    <section class="panel">
+        <div class="panel-title">Charging availability</div>
+        <div class="panel-body">
+            <div class="data-line"><span class="data-label">Current mode:</span> <span id="chargeAvailability">...</span></div>
+            <div class="actions">
+                <button onclick="setChargeMode('ALWAYS_ON')">Available for charging</button>
+                <button onclick="setChargeMode('ALWAYS_OFF')">Not available for charging</button>
+            </div>
+            <div class="note">Availability is a group-level GARO mode. Schedule support will use the same mode control later.</div>
+        </div>
+    </section>
+
     <section class="panel">
         <div class="panel-title">Configuration</div>
         <div class="panel-body">
             <div class="config-grid">
-                <label for="enabled">Enabled</label>
+                <label for="enabled">Controller enabled</label>
                 <input id="enabled" type="checkbox">
 
-                <label for="mode">Mode</label>
+                <label for="mode">Controller mode</label>
                 <select id="mode">
                     <option value="automatic">Automatic</option>
                     <option value="safe">Safe</option>
@@ -837,17 +1152,23 @@ button:hover { background: #eee; }
                 <label for="hourlyLimit">Hourly grid limit</label>
                 <div><input id="hourlyLimit" type="number" min="0.1" step="0.01"> kWh</div>
 
-                <label for="safeCurrent">Safe/default current</label>
+                <label for="safeCurrent">Safe/default CENTRAL100 current</label>
                 <div><input id="safeCurrent" type="number" min="6" step="1"> A</div>
 
-                <label for="minimumCurrent">Minimum current</label>
+                <label for="minimumCurrent">Minimum CENTRAL100 current</label>
                 <div><input id="minimumCurrent" type="number" min="6" step="1"> A</div>
 
                 <label for="maximumCurrent">Maximum CENTRAL100 current</label>
                 <div><input id="maximumCurrent" type="number" min="6" step="1"> A</div>
 
-                <label for="manualCurrent">Manual current</label>
+                <label for="manualCurrent">Manual CENTRAL100 current</label>
                 <div><input id="manualCurrent" type="number" min="6" step="1"> A</div>
+
+                <label for="loadBalancingFuse101">CENTRAL101 limit</label>
+                <div>
+                    <input id="loadBalancingFuse101" type="number" min="16" max="2500" step="1"> A
+                    <span class="current-value">Current GARO: <span id="currentFuse101">...</span></span>
+                </div>
 
                 <label for="tibberTimeout">Tibber stale timeout</label>
                 <div><input id="tibberTimeout" type="number" min="5" step="1"> s</div>
@@ -866,7 +1187,7 @@ button:hover { background: #eee; }
                 <button onclick="saveConfig()">Save configuration</button>
                 <button onclick="applySafe()">Restore safe current</button>
             </div>
-            <div class="note">Automatic mode controls CENTRAL100 from the configured hourly grid-import limit.</div>
+            <div class="note">Saving CENTRAL101 updates GARO only when the configured value differs from the charger.</div>
         </div>
     </section>
 
@@ -950,76 +1271,27 @@ function staleSuffix(stale) {
     return stale ? " (stale)" : "";
 }
 
-function formatPhaseCurrents(c, prefix) {
-    if (!c[prefix + "_valid"]) {
-        return "-";
+function formatChargeMode(mode) {
+    switch (mode) {
+    case "ALWAYS_ON": return "Available for charging";
+    case "ALWAYS_OFF": return "Not available for charging";
+    case "SCHEMA": return "Schedule";
+    default: return mode || "-";
     }
-    const p1 = c[prefix + "_phase1_a"];
-    const p2 = c[prefix + "_phase2_a"];
-    const p3 = c[prefix + "_phase3_a"];
-    return p1.toFixed(1) + " / " + p2.toFixed(1) + " / " + p3.toFixed(1) + " A" +
-        staleSuffix(c[prefix + "_stale"]);
 }
 
-function formatPilotCurrents(c) {
-    const pilots = c.pilot_levels || [];
-    if (!c.pilot_valid || pilots.length === 0) {
-        return "-";
-    }
-    return pilots.map(p => p.serial_number + ": " + p.pilot_a + " A").join(" / ") +
-        staleSuffix(c.pilot_stale);
-}
-
-async function refreshStatus() {
+async function refreshSettingsStatus() {
     try {
         const r = await fetch("/api/status", {cache: "no-store"});
+        if (!r.ok) {
+            throw new Error(await r.text());
+        }
         const s = await r.json();
-        const t = s.tibber || {};
         const c = s.controller || {};
-
-        setText("garo", s.garo_online ? "Online" : "Offline");
-        setText("fuse100", s.load_balancing_fuse !== undefined ? s.load_balancing_fuse + " A" + staleSuffix(c.dlm_config_stale) : "-");
-        setText("fuse101", s.load_balancing_fuse_101 !== undefined ? s.load_balancing_fuse_101 + " A" + staleSuffix(c.dlm_config_stale) : "-");
-        setText("controllerStatus", s.enabled ? s.mode : "Disabled");
-        setText("charging", c.central101_valid ? (c.charging ? "Yes" : "No") + staleSuffix(c.central101_stale) : "-");
-        setText("phaseMode", c.central101_valid ? (c.phase_mode || "-") + staleSuffix(c.central101_stale) : "-");
-        setText("pilotCurrents", formatPilotCurrents(c));
-        setText("calculatedDlmTarget", c.calculated_dlm_target_a ? c.calculated_dlm_target_a + " A" : "-");
-        setText("decision", c.decision || "-");
-        setText("central100Current", formatPhaseCurrents(c, "central100"));
-        setText("central101Current", formatPhaseCurrents(c, "central101"));
-        setText("dlmHeadroom", c.central100_valid && c.dlm_config_valid ? c.dlm_headroom_a.toFixed(1) + " A" + staleSuffix(c.central100_stale || c.dlm_config_stale) : "-");
-        setText("lastAdjustment", c.last_adjustment_age_seconds !== undefined ? c.last_adjustment_age_seconds + " s ago" : "-");
-        setText("powerHeadroom", c.energy_valid ? Math.round(c.power_headroom_w) + " W" : "-");
-        setText("controlSource", c.source || "-");
-        setText("hourEnergy", c.energy_valid ? c.hour_energy_kwh.toFixed(3) + " kWh" : "-");
-        setText("expectedHourEnergy", c.energy_valid ? c.expected_hour_energy_kwh.toFixed(3) + " kWh" : "-");
-        setText("pacingError", c.energy_valid ? (c.energy_pacing_error_kwh >= 0 ? "+" : "") + c.energy_pacing_error_kwh.toFixed(3) + " kWh" : "-");
-        setText("remainingEnergy", c.energy_valid ? c.remaining_energy_kwh.toFixed(3) + " kWh" : "-");
-        setText("baseTargetPower", c.energy_valid ? Math.round(c.base_target_power_w) + " W" : "-");
-        setText("pacingCorrection", c.energy_valid ? (c.pacing_correction_w >= 0 ? "+" : "") + Math.round(c.pacing_correction_w) + " W" : "-");
-        setText("pacingTarget", c.energy_valid ? Math.round(c.pacing_target_power_w) + " W" : "-");
-        setText("hardBudgetCeiling", c.energy_valid ? Math.round(c.hard_budget_ceiling_w) + " W" : "-");
-        setText("allowedPower", c.energy_valid ? Math.round(c.effective_target_power_w) + " W" : "-");
-
-        setText("tibber", !t.configured ? "Not configured" : (t.connected ? "Connected" : "Disconnected"));
-        setText("tibberHome", t.home_name || t.home_id || "-");
-        setText("tibberPower", t.connected ? Math.round(t.power_w) + " W" : "-");
-        setText("tibberProduction", t.connected ? Math.round(t.power_production_w) + " W" : "-");
-        setText("tibberHour", t.last_update ? t.accumulated_consumption_last_hour_kwh.toFixed(3) + " kWh" : "-");
-        setText("tibberAge", t.last_update ? t.age_seconds + " s" : "-");
-        setText("tibberApiRequests", t.api_request_count ?? 0);
-        setText("tibberApiLast", t.last_api_request ? t.last_api_request_age_seconds + " s ago" : "-");
-        setText("tibberApiResult", t.last_api_result || "-");
-
-        const modeText = s.enabled ? s.mode.charAt(0).toUpperCase() + s.mode.slice(1) : "Disabled";
-        const chargeText = c.central101_valid ? (c.charging ? " - Charging" : " - Not charging") + staleSuffix(c.central101_stale) : " - Charge state unavailable";
-        setText("topStatus", modeText + chargeText);
-
-        if (t.error) {
-            setText("error", "Tibber: " + t.error);
-        } else {
-            setText("error", s.error || "");
+        setText("chargeAvailability", s.charge_mode_valid ? formatChargeMode(s.charge_mode) + staleSuffix(s.charge_mode_stale) : "-");
+        setText("currentFuse101", s.load_balancing_fuse_101 !== undefined ? s.load_balancing_fuse_101 + " A" + staleSuffix(c.dlm_config_stale) : "-");
+        if (s.error) {
+            setText("error", s.error);
         }
     } catch (e) {
         setText("error", "Status request failed: " + e);
@@ -1041,6 +1313,7 @@ async function loadConfiguration() {
         document.getElementById("minimumCurrent").value = c.minimum_current_a;
         document.getElementById("maximumCurrent").value = c.maximum_current_a;
         document.getElementById("manualCurrent").value = c.manual_current_a;
+        document.getElementById("loadBalancingFuse101").value = c.load_balancing_fuse_101_a;
         document.getElementById("tibberTimeout").value = c.tibber_timeout_seconds;
         document.getElementById("controlInterval").value = c.control_interval_seconds;
         document.getElementById("idleTimeout").value = c.idle_timeout_seconds;
@@ -1083,6 +1356,7 @@ async function saveConfig() {
         minimum_current_a: Number(document.getElementById("minimumCurrent").value),
         maximum_current_a: Number(document.getElementById("maximumCurrent").value),
         manual_current_a: Number(document.getElementById("manualCurrent").value),
+        load_balancing_fuse_101_a: Number(document.getElementById("loadBalancingFuse101").value),
         tibber_timeout_seconds: Number(document.getElementById("tibberTimeout").value),
         control_interval_seconds: Number(document.getElementById("controlInterval").value),
         idle_timeout_seconds: Number(document.getElementById("idleTimeout").value),
@@ -1127,7 +1401,7 @@ async function saveConfig() {
     }
 
     setText("message", result.saved ? "Configuration saved." : "Configuration unchanged.");
-    await refreshStatus();
+    await refreshSettingsStatus();
 }
 
 async function applySafe() {
@@ -1141,23 +1415,36 @@ async function applySafe() {
     }
 
     setText("message", "Safe current applied.");
-    await refreshStatus();
+    await refreshSettingsStatus();
 }
 
+async function setChargeMode(mode) {
+    setText("message", "");
+    setText("error", "");
+
+    const r = await fetch("/api/charge-mode", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({mode: mode})
+    });
+
+    if (!r.ok) {
+        setText("error", await r.text());
+        return;
+    }
+
+    setText("message", mode === "ALWAYS_ON" ? "Charging is available." : "Charging is not available.");
+    await refreshSettingsStatus();
+}
 document.getElementById("garoLogo").addEventListener("dblclick", function () {
     const panel = document.getElementById("controlTuningPanel");
     panel.hidden = !panel.hidden;
 });
 
-document.addEventListener("keydown", function (event) {
-    if (event.key === "Escape") {
-        document.getElementById("controlTuningPanel").hidden = true;
-    }
-});
 
 loadConfiguration();
-refreshStatus();
-setInterval(refreshStatus, 5000);
+refreshSettingsStatus();
+setInterval(refreshSettingsStatus, 5000);
 </script>
 </body>
 </html>`

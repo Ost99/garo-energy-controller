@@ -89,25 +89,32 @@ type GaroPilotLevel struct {
 	PilotA       int `json:"pilot_a"`
 }
 
-func (g *GaroClient) GetPilotLevels() ([]GaroPilotLevel, error) {
+type GaroFastInfo struct {
+	PilotLevels []GaroPilotLevel
+	ChargeMode  string
+}
+
+func (g *GaroClient) GetFastInfo() (GaroFastInfo, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	type pilotResponse struct {
-		SerialNumber int `json:"serialNumber"`
-		PilotLevel   int `json:"pilotLevel"`
+		SerialNumber int    `json:"serialNumber"`
+		PilotLevel   int    `json:"pilotLevel"`
+		Mode         string `json:"mode"`
 	}
 
+	var info GaroFastInfo
 	levels := make(map[int]int)
 
 	resp, err := g.client.Get(g.baseURL + "/status")
 	if err != nil {
-		return nil, err
+		return info, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf(
+		return info, fmt.Errorf(
 			"GET status: HTTP %d: %s",
 			resp.StatusCode,
 			string(body),
@@ -117,23 +124,24 @@ func (g *GaroClient) GetPilotLevels() ([]GaroPilotLevel, error) {
 	var master pilotResponse
 	if err := json.NewDecoder(resp.Body).Decode(&master); err != nil {
 		resp.Body.Close()
-		return nil, err
+		return info, err
 	}
 	resp.Body.Close()
 
 	if master.SerialNumber != 0 {
 		levels[master.SerialNumber] = master.PilotLevel
 	}
+	info.ChargeMode = master.Mode
 
 	resp, err = g.client.Get(g.baseURL + "/slaves/false")
 	if err != nil {
-		return nil, err
+		return info, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf(
+		return info, fmt.Errorf(
 			"GET slaves/false: HTTP %d: %s",
 			resp.StatusCode,
 			string(body),
@@ -142,7 +150,7 @@ func (g *GaroClient) GetPilotLevels() ([]GaroPilotLevel, error) {
 
 	var slaves []pilotResponse
 	if err := json.NewDecoder(resp.Body).Decode(&slaves); err != nil {
-		return nil, err
+		return info, err
 	}
 
 	for _, slave := range slaves {
@@ -151,19 +159,19 @@ func (g *GaroClient) GetPilotLevels() ([]GaroPilotLevel, error) {
 		}
 	}
 
-	result := make([]GaroPilotLevel, 0, len(levels))
+	info.PilotLevels = make([]GaroPilotLevel, 0, len(levels))
 	for serial, pilot := range levels {
-		result = append(result, GaroPilotLevel{
+		info.PilotLevels = append(info.PilotLevels, GaroPilotLevel{
 			SerialNumber: serial,
 			PilotA:       pilot,
 		})
 	}
 
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].SerialNumber > result[j].SerialNumber
+	sort.Slice(info.PilotLevels, func(i, j int) bool {
+		return info.PilotLevels[i].SerialNumber > info.PilotLevels[j].SerialNumber
 	})
 
-	return result, nil
+	return info, nil
 }
 
 type GaroCache struct {
@@ -189,6 +197,11 @@ type GaroCache struct {
 	pilotValid  bool
 	pilotAt     time.Time
 	pilotError  string
+
+	chargeMode      string
+	chargeModeValid bool
+	chargeModeAt    time.Time
+	chargeModeError string
 }
 
 type GaroMeterRefreshResult struct {
@@ -221,6 +234,12 @@ type GaroCacheSnapshot struct {
 	PilotAgeSeconds int64
 	PilotStale      bool
 	PilotError      string
+
+	ChargeMode           string
+	ChargeModeValid      bool
+	ChargeModeAgeSeconds int64
+	ChargeModeStale      bool
+	ChargeModeError      string
 
 	Online bool
 }
@@ -259,6 +278,9 @@ func (c *GaroCache) Snapshot(now time.Time) GaroCacheSnapshot {
 		LBError:              c.lbError,
 		PilotValid:           c.pilotValid,
 		PilotError:           c.pilotError,
+		ChargeMode:           c.chargeMode,
+		ChargeModeValid:      c.chargeModeValid,
+		ChargeModeError:      c.chargeModeError,
 	}
 
 	s.PilotLevels = append([]GaroPilotLevel(nil), c.pilotLevels...)
@@ -275,12 +297,16 @@ func (c *GaroCache) Snapshot(now time.Time) GaroCacheSnapshot {
 	if c.pilotValid {
 		s.PilotAgeSeconds, s.PilotStale = sourceAge(now, c.pilotAt)
 	}
+	if c.chargeModeValid {
+		s.ChargeModeAgeSeconds, s.ChargeModeStale = sourceAge(now, c.chargeModeAt)
+	}
 
 	s.Online =
 		(c.central100Valid && !s.Central100Stale) ||
 			(c.central101Valid && !s.Central101Stale) ||
 			(c.lbValid && !s.LBStale) ||
-			(c.pilotValid && !s.PilotStale)
+			(c.pilotValid && !s.PilotStale) ||
+			(c.chargeModeValid && !s.ChargeModeStale)
 
 	return s
 }
@@ -319,15 +345,22 @@ func (c *GaroCache) RefreshMeters(g *GaroClient) GaroMeterRefreshResult {
 }
 
 func (c *GaroCache) RefreshFast(g *GaroClient) {
-	pilots, err := g.GetPilotLevels()
+	fastInfo, err := g.GetFastInfo()
 	c.mu.Lock()
 	if err != nil {
 		c.pilotError = err.Error()
+		c.chargeModeError = err.Error()
 	} else {
-		c.pilotLevels = append(c.pilotLevels[:0], pilots...)
+		now := time.Now()
+		c.pilotLevels = append(c.pilotLevels[:0], fastInfo.PilotLevels...)
 		c.pilotValid = true
-		c.pilotAt = time.Now()
+		c.pilotAt = now
 		c.pilotError = ""
+
+		c.chargeMode = fastInfo.ChargeMode
+		c.chargeModeValid = fastInfo.ChargeMode != ""
+		c.chargeModeAt = now
+		c.chargeModeError = ""
 	}
 	c.mu.Unlock()
 
@@ -382,6 +415,27 @@ func (c *GaroCache) NoteLoadBalancingFuse(currentA int) {
 	}
 }
 
+func (c *GaroCache) NoteLoadBalancingFuse101(currentA int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.loadBalancingFuse101 = currentA
+	if c.lbValid {
+		c.lbAt = time.Now()
+		c.lbError = ""
+	}
+}
+
+func (c *GaroCache) NoteChargeMode(mode string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.chargeMode = mode
+	c.chargeModeValid = mode != ""
+	c.chargeModeAt = time.Now()
+	c.chargeModeError = ""
+}
+
 func garoErrorSummary(s GaroCacheSnapshot) string {
 	parts := make([]string, 0, 4)
 	if s.Central100Error != "" {
@@ -395,6 +449,9 @@ func garoErrorSummary(s GaroCacheSnapshot) string {
 	}
 	if s.PilotError != "" {
 		parts = append(parts, "pilot status: "+s.PilotError)
+	}
+	if s.ChargeModeError != "" && s.ChargeModeError != s.PilotError {
+		parts = append(parts, "charge mode: "+s.ChargeModeError)
 	}
 	return strings.Join(parts, "; ")
 }

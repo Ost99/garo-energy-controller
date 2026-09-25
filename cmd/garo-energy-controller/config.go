@@ -43,10 +43,11 @@ type Config struct {
 
 	HourlyLimitKWh float64 `json:"hourly_limit_kwh"`
 
-	SafeCurrentA    int `json:"safe_current_a"`
-	MinimumCurrentA int `json:"minimum_current_a"`
-	MaximumCurrentA int `json:"maximum_current_a"`
-	ManualCurrentA  int `json:"manual_current_a"`
+	SafeCurrentA          int `json:"safe_current_a"`
+	MinimumCurrentA       int `json:"minimum_current_a"`
+	MaximumCurrentA       int `json:"maximum_current_a"`
+	ManualCurrentA        int `json:"manual_current_a"`
+	LoadBalancingFuse101A int `json:"load_balancing_fuse_101_a"`
 
 	TibberTimeoutSeconds   int `json:"tibber_timeout_seconds"`
 	ControlIntervalSeconds int `json:"control_interval_seconds"`
@@ -94,10 +95,11 @@ func defaultConfig() Config {
 
 		HourlyLimitKWh: 9.5,
 
-		SafeCurrentA:    8,
-		MinimumCurrentA: 6,
-		MaximumCurrentA: 50,
-		ManualCurrentA:  8,
+		SafeCurrentA:          8,
+		MinimumCurrentA:       6,
+		MaximumCurrentA:       50,
+		ManualCurrentA:        8,
+		LoadBalancingFuse101A: 32,
 
 		TibberTimeoutSeconds:   30,
 		ControlIntervalSeconds: 30,
@@ -128,6 +130,12 @@ func (c Config) Validate() error {
 	}
 	if c.ManualCurrentA < c.MinimumCurrentA || c.ManualCurrentA > c.MaximumCurrentA {
 		return fmt.Errorf("manual_current_a must be within the configured current range")
+	}
+	// GARO's native LB Meter 101 UI accepts 16..2500 A. Keep the same
+	// validation range so this controller never submits a value the firmware
+	// itself considers invalid.
+	if c.LoadBalancingFuse101A < 16 || c.LoadBalancingFuse101A > 2500 {
+		return fmt.Errorf("load_balancing_fuse_101_a must be 16..2500")
 	}
 	if c.TibberTimeoutSeconds < 5 {
 		return fmt.Errorf("tibber_timeout_seconds must be at least 5")
