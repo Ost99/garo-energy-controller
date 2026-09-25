@@ -27,6 +27,9 @@ type ControlTuningConfig struct {
 
 	CalculatedReserveW float64 `json:"calculated_reserve_w"`
 
+	PacingHorizonSeconds int     `json:"pacing_horizon_seconds"`
+	MaxPacingAdjustmentW float64 `json:"max_pacing_adjustment_w"`
+
 	NormalDwellSeconds int `json:"normal_dwell_seconds"`
 	MidUpDwellSeconds  int `json:"mid_up_dwell_seconds"`
 	NearUpDwellSeconds int `json:"near_up_dwell_seconds"`
@@ -72,6 +75,9 @@ func defaultControlTuning() ControlTuningConfig {
 		MultiPhaseWattsPerAmp:          720,
 
 		CalculatedReserveW: 1000,
+
+		PacingHorizonSeconds: 1800,
+		MaxPacingAdjustmentW: 2500,
 
 		NormalDwellSeconds: 60,
 		MidUpDwellSeconds:  90,
@@ -166,6 +172,12 @@ func (t ControlTuningConfig) Validate() error {
 	}
 	if t.CalculatedReserveW < 0 {
 		return fmt.Errorf("control_tuning.calculated_reserve_w must be >= 0")
+	}
+	if t.PacingHorizonSeconds < 60 {
+		return fmt.Errorf("control_tuning.pacing_horizon_seconds must be at least 60")
+	}
+	if t.MaxPacingAdjustmentW < 0 {
+		return fmt.Errorf("control_tuning.max_pacing_adjustment_w must be >= 0")
 	}
 	if t.NormalDwellSeconds < 0 || t.MidUpDwellSeconds < 0 || t.NearUpDwellSeconds < 0 {
 		return fmt.Errorf("control_tuning dwell values must be >= 0")

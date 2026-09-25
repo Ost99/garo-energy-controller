@@ -493,12 +493,19 @@ type ControllerSnapshot struct {
 	PilotStale      bool             `json:"pilot_stale"`
 	PilotError      string           `json:"pilot_error,omitempty"`
 
-	HourEnergyKWh      float64 `json:"hour_energy_kwh"`
-	RemainingEnergyKWh float64 `json:"remaining_energy_kwh"`
+	HourEnergyKWh         float64 `json:"hour_energy_kwh"`
+	RemainingEnergyKWh    float64 `json:"remaining_energy_kwh"`
+	ExpectedHourEnergyKWh float64 `json:"expected_hour_energy_kwh"`
+	EnergyPacingErrorKWh  float64 `json:"energy_pacing_error_kwh"`
 
-	GridPowerW           float64 `json:"grid_power_w"`
-	AllowedAveragePowerW float64 `json:"allowed_average_power_w"`
-	PowerHeadroomW       float64 `json:"power_headroom_w"`
+	GridPowerW            float64 `json:"grid_power_w"`
+	BaseTargetPowerW      float64 `json:"base_target_power_w"`
+	PacingCorrectionW     float64 `json:"pacing_correction_w"`
+	PacingTargetPowerW    float64 `json:"pacing_target_power_w"`
+	HardBudgetCeilingW    float64 `json:"hard_budget_ceiling_w"`
+	EffectiveTargetPowerW float64 `json:"effective_target_power_w"`
+	AllowedAveragePowerW  float64 `json:"allowed_average_power_w"`
+	PowerHeadroomW        float64 `json:"power_headroom_w"`
 
 	SecondsRemaining int    `json:"seconds_remaining"`
 	ReferenceTime    string `json:"reference_time,omitempty"`
@@ -912,12 +919,65 @@ func populateEnergyDiagnostics(
 	}
 
 	s.SecondsRemaining = secondsRemaining
-	s.AllowedAveragePowerW =
+
+	// The hourly limit is both a nominal power target and a hard energy
+	// ceiling. Pace toward the nominal target over a fixed recovery horizon
+	// instead of trying to spend every unused Wh before the top of the hour.
+	// This prevents the target from accelerating sharply as secondsRemaining
+	// approaches zero.
+	baseTargetPowerW := cfg.HourlyLimitKWh * 1000.0
+	elapsedSeconds := 3600 - secondsRemaining
+	if elapsedSeconds < 0 {
+		elapsedSeconds = 0
+	}
+	if elapsedSeconds > 3600 {
+		elapsedSeconds = 3600
+	}
+
+	expectedHourEnergyKWh :=
+		cfg.HourlyLimitKWh * float64(elapsedSeconds) / 3600.0
+	energyPacingErrorKWh := expectedHourEnergyKWh - hourEnergy
+
+	pacingCorrectionW :=
+		energyPacingErrorKWh * 3600000.0 /
+			float64(cfg.ControlTuning.PacingHorizonSeconds)
+	maxPacingAdjustmentW := cfg.ControlTuning.MaxPacingAdjustmentW
+	if pacingCorrectionW > maxPacingAdjustmentW {
+		pacingCorrectionW = maxPacingAdjustmentW
+	} else if pacingCorrectionW < -maxPacingAdjustmentW {
+		pacingCorrectionW = -maxPacingAdjustmentW
+	}
+
+	pacingTargetPowerW := baseTargetPowerW + pacingCorrectionW
+	if pacingTargetPowerW < 0 {
+		pacingTargetPowerW = 0
+	}
+
+	hardBudgetCeilingW :=
 		remainingEnergy * 3600000.0 /
 			float64(secondsRemaining)
 
-	s.PowerHeadroomW =
-		s.AllowedAveragePowerW - gridPower
+	effectiveTargetPowerW := math.Min(
+		pacingTargetPowerW,
+		hardBudgetCeilingW,
+	)
+	if effectiveTargetPowerW < 0 {
+		effectiveTargetPowerW = 0
+	}
+
+	s.ExpectedHourEnergyKWh = expectedHourEnergyKWh
+	s.EnergyPacingErrorKWh = energyPacingErrorKWh
+	s.BaseTargetPowerW = baseTargetPowerW
+	s.PacingCorrectionW = pacingCorrectionW
+	s.PacingTargetPowerW = pacingTargetPowerW
+	s.HardBudgetCeilingW = hardBudgetCeilingW
+	s.EffectiveTargetPowerW = effectiveTargetPowerW
+
+	// Keep AllowedAveragePowerW as a compatibility field for existing UI and
+	// controller logic. It now represents the effective target selected by the
+	// pacing algorithm, not the raw remaining-energy/remaining-time ceiling.
+	s.AllowedAveragePowerW = effectiveTargetPowerW
+	s.PowerHeadroomW = effectiveTargetPowerW - gridPower
 }
 
 func (c *EnergyController) tick() {

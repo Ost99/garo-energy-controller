@@ -803,8 +803,14 @@ button:hover { background: #eee; }
             <div class="status-item"><span class="label">Grid export now</span><span id="tibberProduction">...</span></div>
             <div class="status-item"><span class="label">Imported this hour</span><span id="tibberHour">...</span></div>
             <div class="status-item"><span class="label">Controller hour energy</span><span id="hourEnergy">...</span></div>
+            <div class="status-item"><span class="label">Expected energy by now</span><span id="expectedHourEnergy">...</span></div>
+            <div class="status-item"><span class="label">Energy pacing error</span><span id="pacingError">...</span></div>
             <div class="status-item"><span class="label">Remaining allowance</span><span id="remainingEnergy">...</span></div>
-            <div class="status-item"><span class="label">Allowed average power</span><span id="allowedPower">...</span></div>
+            <div class="status-item"><span class="label">Base target</span><span id="baseTargetPower">...</span></div>
+            <div class="status-item"><span class="label">Pacing correction</span><span id="pacingCorrection">...</span></div>
+            <div class="status-item"><span class="label">Pacing target</span><span id="pacingTarget">...</span></div>
+            <div class="status-item"><span class="label">Hard budget ceiling</span><span id="hardBudgetCeiling">...</span></div>
+            <div class="status-item"><span class="label">Effective target</span><span id="allowedPower">...</span></div>
             <div class="status-item"><span class="label">Power headroom</span><span id="powerHeadroom">...</span></div>
             <div class="status-item"><span class="label">Last DLM adjustment</span><span id="lastAdjustment">...</span></div>
             <div class="status-item"><span class="label">Tibber data age</span><span id="tibberAge">...</span></div>
@@ -907,6 +913,12 @@ button:hover { background: #eee; }
                 <label for="calculatedReserve">Calculated increase reserve</label>
                 <div><input id="calculatedReserve" type="number" min="0" step="50"> W</div>
 
+                <label for="pacingHorizon">Pacing horizon</label>
+                <div><input id="pacingHorizon" type="number" min="60" step="60"> s</div>
+
+                <label for="maxPacingAdjustment">Maximum pacing adjustment</label>
+                <div><input id="maxPacingAdjustment" type="number" min="0" step="100"> W</div>
+
                 <label for="normalDwell">Normal dwell</label>
                 <div><input id="normalDwell" type="number" min="0" step="1"> s</div>
 
@@ -981,8 +993,14 @@ async function refreshStatus() {
         setText("powerHeadroom", c.energy_valid ? Math.round(c.power_headroom_w) + " W" : "-");
         setText("controlSource", c.source || "-");
         setText("hourEnergy", c.energy_valid ? c.hour_energy_kwh.toFixed(3) + " kWh" : "-");
+        setText("expectedHourEnergy", c.energy_valid ? c.expected_hour_energy_kwh.toFixed(3) + " kWh" : "-");
+        setText("pacingError", c.energy_valid ? (c.energy_pacing_error_kwh >= 0 ? "+" : "") + c.energy_pacing_error_kwh.toFixed(3) + " kWh" : "-");
         setText("remainingEnergy", c.energy_valid ? c.remaining_energy_kwh.toFixed(3) + " kWh" : "-");
-        setText("allowedPower", c.energy_valid ? Math.round(c.allowed_average_power_w) + " W" : "-");
+        setText("baseTargetPower", c.energy_valid ? Math.round(c.base_target_power_w) + " W" : "-");
+        setText("pacingCorrection", c.energy_valid ? (c.pacing_correction_w >= 0 ? "+" : "") + Math.round(c.pacing_correction_w) + " W" : "-");
+        setText("pacingTarget", c.energy_valid ? Math.round(c.pacing_target_power_w) + " W" : "-");
+        setText("hardBudgetCeiling", c.energy_valid ? Math.round(c.hard_budget_ceiling_w) + " W" : "-");
+        setText("allowedPower", c.energy_valid ? Math.round(c.effective_target_power_w) + " W" : "-");
 
         setText("tibber", !t.configured ? "Not configured" : (t.connected ? "Connected" : "Disconnected"));
         setText("tibberHome", t.home_name || t.home_id || "-");
@@ -1042,6 +1060,8 @@ async function loadConfiguration() {
         document.getElementById("multiPhaseMaxStep").value = t.multi_phase_max_calculated_step_a;
         document.getElementById("multiPhaseWattsPerAmp").value = t.multi_phase_watts_per_amp;
         document.getElementById("calculatedReserve").value = t.calculated_reserve_w;
+        document.getElementById("pacingHorizon").value = t.pacing_horizon_seconds;
+        document.getElementById("maxPacingAdjustment").value = t.max_pacing_adjustment_w;
         document.getElementById("normalDwell").value = t.normal_dwell_seconds;
         document.getElementById("midUpDwell").value = t.mid_up_dwell_seconds;
         document.getElementById("nearUpDwell").value = t.near_up_dwell_seconds;
@@ -1081,6 +1101,8 @@ async function saveConfig() {
             multi_phase_max_calculated_step_a: Number(document.getElementById("multiPhaseMaxStep").value),
             multi_phase_watts_per_amp: Number(document.getElementById("multiPhaseWattsPerAmp").value),
             calculated_reserve_w: Number(document.getElementById("calculatedReserve").value),
+            pacing_horizon_seconds: Number(document.getElementById("pacingHorizon").value),
+            max_pacing_adjustment_w: Number(document.getElementById("maxPacingAdjustment").value),
             normal_dwell_seconds: Number(document.getElementById("normalDwell").value),
             mid_up_dwell_seconds: Number(document.getElementById("midUpDwell").value),
             near_up_dwell_seconds: Number(document.getElementById("nearUpDwell").value),
