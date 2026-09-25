@@ -912,6 +912,9 @@ const statusPage = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GARO Energy Controller</title>
 <link rel="stylesheet" href="/garo-jquery/jquery.mobile.icons.min.css">
+<link rel="icon" sizes="192x192" href="/garo-assets/garologo.png">
+<link rel="shortcut icon" href="/garo-assets/garologo.png">
+<link rel="apple-touch-icon" href="/garo-assets/garologo.png">
 <style>` + pageCSS + `</style>
 </head>
 <body>
@@ -1108,6 +1111,9 @@ const settingsPage = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GARO Energy Controller - Settings</title>
 <link rel="stylesheet" href="/garo-jquery/jquery.mobile.icons.min.css">
+<link rel="icon" sizes="192x192" href="/garo-assets/garologo.png">
+<link rel="shortcut icon" href="/garo-assets/garologo.png">
+<link rel="apple-touch-icon" href="/garo-assets/garologo.png">
 <style>` + pageCSS + `</style>
 </head>
 <body>
