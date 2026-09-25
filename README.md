@@ -57,8 +57,8 @@ The web interface is available on port `8090`.
 
 ## TODO
 * Stop charging if target is likely to be overshot
-* Add available for charging / not available for charging control
 * Add favicon from filesystem
+* Implement controls for schduled availability 
 
 ## Notice
 * No icons, logos or images are included in the project, they are read from the running GARO firmware at runtime.
