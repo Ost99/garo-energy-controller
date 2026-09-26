@@ -19,8 +19,10 @@ const (
 	// consumption, not net grid import.
 	fallbackVoltage = 230.0
 
-	garoStaleAfter       = 60 * time.Second
-	garoFastPollInterval = 5 * time.Second
+	garoStaleAfter             = 60 * time.Second
+	garoFastPollInterval       = 5 * time.Second
+	garoDeepIdlePollInterval   = 30 * time.Second
+	garoDeepIdleLBPollInterval = 60 * time.Second
 )
 
 type GaroMeterInfo struct {
@@ -202,6 +204,9 @@ type GaroCache struct {
 	chargeModeValid bool
 	chargeModeAt    time.Time
 	chargeModeError string
+
+	deepIdle bool
+	fastWake chan struct{}
 }
 
 type GaroMeterRefreshResult struct {
@@ -245,7 +250,29 @@ type GaroCacheSnapshot struct {
 }
 
 func NewGaroCache() *GaroCache {
-	return &GaroCache{}
+	return &GaroCache{
+		fastWake: make(chan struct{}, 1),
+	}
+}
+
+func (c *GaroCache) SetDeepIdle(deepIdle bool) {
+	c.mu.Lock()
+	changed := c.deepIdle != deepIdle
+	c.deepIdle = deepIdle
+	c.mu.Unlock()
+
+	if changed {
+		select {
+		case c.fastWake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (c *GaroCache) DeepIdle() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.deepIdle
 }
 
 func sourceAge(now, updated time.Time) (int64, bool) {
@@ -311,6 +338,24 @@ func (c *GaroCache) Snapshot(now time.Time) GaroCacheSnapshot {
 	return s
 }
 
+func (c *GaroCache) RefreshCentral101(g *GaroClient) bool {
+	central101, err := g.GetMeterInfo("CENTRAL101")
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err != nil {
+		c.central101Error = err.Error()
+		return false
+	}
+
+	c.central101 = central101
+	c.central101Valid = true
+	c.central101At = time.Now()
+	c.central101Error = ""
+	return true
+}
+
 func (c *GaroCache) RefreshMeters(g *GaroClient) GaroMeterRefreshResult {
 	now := time.Now()
 	result := GaroMeterRefreshResult{}
@@ -328,48 +373,41 @@ func (c *GaroCache) RefreshMeters(g *GaroClient) GaroMeterRefreshResult {
 	}
 	c.mu.Unlock()
 
-	central101, err := g.GetMeterInfo("CENTRAL101")
-	c.mu.Lock()
-	if err != nil {
-		c.central101Error = err.Error()
-	} else {
-		c.central101 = central101
-		c.central101Valid = true
-		c.central101At = time.Now()
-		c.central101Error = ""
-		result.Central101OK = true
-	}
-	c.mu.Unlock()
+	result.Central101OK = c.RefreshCentral101(g)
 
 	return result
 }
 
-func (c *GaroCache) RefreshFast(g *GaroClient) {
+func (c *GaroCache) RefreshFastInfo(g *GaroClient) {
 	fastInfo, err := g.GetFastInfo()
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if err != nil {
 		c.pilotError = err.Error()
 		c.chargeModeError = err.Error()
-	} else {
-		now := time.Now()
-		c.pilotLevels = append(c.pilotLevels[:0], fastInfo.PilotLevels...)
-		c.pilotValid = true
-		c.pilotAt = now
-		c.pilotError = ""
-
-		c.chargeMode = fastInfo.ChargeMode
-		c.chargeModeValid = fastInfo.ChargeMode != ""
-		c.chargeModeAt = now
-		c.chargeModeError = ""
+		return
 	}
-	c.mu.Unlock()
 
+	now := time.Now()
+	c.pilotLevels = append(c.pilotLevels[:0], fastInfo.PilotLevels...)
+	c.pilotValid = true
+	c.pilotAt = now
+	c.pilotError = ""
+
+	c.chargeMode = fastInfo.ChargeMode
+	c.chargeModeValid = fastInfo.ChargeMode != ""
+	c.chargeModeAt = now
+	c.chargeModeError = ""
+}
+
+func (c *GaroCache) RefreshLoadBalancing(g *GaroClient) bool {
 	lbCfg, err := g.GetLBConfig()
 	if err != nil {
 		c.mu.Lock()
 		c.lbError = err.Error()
 		c.mu.Unlock()
-		return
+		return false
 	}
 
 	fuse100 := rawInt(lbCfg["loadBalancingFuse"])
@@ -378,7 +416,7 @@ func (c *GaroCache) RefreshFast(g *GaroClient) {
 		c.mu.Lock()
 		c.lbError = "load-balancing fuse values missing from GARO configuration"
 		c.mu.Unlock()
-		return
+		return false
 	}
 
 	c.mu.Lock()
@@ -388,18 +426,64 @@ func (c *GaroCache) RefreshFast(g *GaroClient) {
 	c.lbAt = time.Now()
 	c.lbError = ""
 	c.mu.Unlock()
+	return true
+}
+
+func (c *GaroCache) RefreshFast(g *GaroClient) {
+	c.RefreshFastInfo(g)
+	c.RefreshLoadBalancing(g)
 }
 
 func (c *GaroCache) RunFast(ctx context.Context, g *GaroClient) {
-	ticker := time.NewTicker(garoFastPollInterval)
-	defer ticker.Stop()
+	lastLBRefresh := time.Now()
 
 	for {
+		deepIdle := c.DeepIdle()
+		interval := garoFastPollInterval
+		if deepIdle {
+			interval = garoDeepIdlePollInterval
+		}
+
+		timer := time.NewTimer(interval)
+
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+
+		case <-c.fastWake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+
+			// Leaving deep idle should restore the fast status cache immediately.
+			// The control loop separately refreshes the load-balancing configuration
+			// before it makes the first active DLM decision.
+			if !c.DeepIdle() {
+				c.RefreshFastInfo(g)
+			}
+			continue
+
+		case <-timer.C:
+		}
+
+		if !c.DeepIdle() {
 			c.RefreshFast(g)
+			lastLBRefresh = time.Now()
+			continue
+		}
+
+		// Deep idle: pilot/charge-mode information is useful for status, but it
+		// does not need a five-second cadence. Refresh /status and /slaves/false
+		// every 30 seconds, and the more static load-balancing configuration only
+		// every 60 seconds.
+		c.RefreshFastInfo(g)
+		if time.Since(lastLBRefresh) >= garoDeepIdleLBPollInterval {
+			c.RefreshLoadBalancing(g)
+			lastLBRefresh = time.Now()
 		}
 	}
 }
@@ -821,6 +905,14 @@ func (c *EnergyController) Run(ctx context.Context) {
 			interval = 5 * time.Second
 		}
 
+		// Once the charger has been idle long enough for the safe current to
+		// be restored, only wake the control loop every 30 seconds. The deep-idle
+		// tick polls CENTRAL101 only, so charging detection remains available
+		// without continuously running the full metering/pacing calculation.
+		if cfg.Enabled && cfg.Mode == "automatic" && c.safeApplied {
+			interval = garoDeepIdlePollInterval
+		}
+
 		timer := time.NewTimer(interval)
 
 		select {
@@ -1037,6 +1129,27 @@ func populateEnergyDiagnostics(
 	s.PowerHeadroomW = effectiveTargetPowerW - gridPower
 }
 
+func clearEnergyDiagnostics(s *ControllerSnapshot) {
+	s.Source = ""
+	s.EnergyValid = false
+	s.HourEnergyKWh = 0
+	s.RemainingEnergyKWh = 0
+	s.ExpectedHourEnergyKWh = 0
+	s.EnergyPacingErrorKWh = 0
+	s.GridPowerW = 0
+	s.BaseTargetPowerW = 0
+	s.PacingCorrectionW = 0
+	s.PacingTargetPowerW = 0
+	s.HardBudgetCeilingW = 0
+	s.EffectiveTargetPowerW = 0
+	s.AllowedAveragePowerW = 0
+	s.PowerHeadroomW = 0
+	s.SecondsRemaining = 0
+	s.ReferenceTime = ""
+	s.CalculatedRequiredIncreaseA = 0
+	s.CalculatedDLMTargetA = 0
+}
+
 func (c *EnergyController) tick() {
 	now := time.Now()
 	cfg := c.getConfig()
@@ -1055,6 +1168,49 @@ func (c *EnergyController) tick() {
 	age := c.adjustmentAge(now)
 	if age < 365*24*time.Hour {
 		s.LastAdjustmentAgeSeconds = int64(age.Seconds())
+	}
+
+	// After the charger has remained idle long enough for SafeCurrentA to be
+	// restored, use a lightweight monitoring path. CENTRAL101 alone is enough
+	// to tell whether charging has resumed. Avoid refreshing CENTRAL100 and
+	// avoid running the hourly energy/pacing calculations until then.
+	if cfg.Enabled && cfg.Mode == "automatic" && c.safeApplied {
+		c.garoCache.SetDeepIdle(true)
+		central101Fresh := c.garoCache.RefreshCentral101(c.garo)
+		garoState := c.garoCache.Snapshot(now)
+		mergeGaroDiagnostics(&s, garoState)
+		s.Error = garoErrorSummary(garoState)
+		s.State = "idle"
+		clearEnergyDiagnostics(&s)
+
+		if !central101Fresh {
+			s.Decision =
+				"deep idle; CENTRAL101 refresh failed; retaining safe current"
+			c.setSnapshot(s)
+			return
+		}
+
+		if !s.Charging {
+			s.Decision = fmt.Sprintf(
+				"deep idle; safe current %d A; charging check every %ds",
+				cfg.SafeCurrentA,
+				int(garoDeepIdlePollInterval.Seconds()),
+			)
+			c.setSnapshot(s)
+			return
+		}
+
+		// Charging was detected by the lightweight poll. Clear the deep-idle
+		// state and immediately continue through a complete control tick so the
+		// first pacing/DLM decision is made without another 30-second delay.
+		c.idleSince = time.Time{}
+		c.safeApplied = false
+		c.garoCache.SetDeepIdle(false)
+
+		// The deep-idle fast loop refreshes DLM configuration only once per
+		// minute. Refresh it synchronously here so the first active control
+		// decision never waits for the background fast loop to catch up.
+		c.garoCache.RefreshLoadBalancing(c.garo)
 	}
 
 	refresh := c.garoCache.RefreshMeters(c.garo)
@@ -1087,6 +1243,10 @@ func (c *EnergyController) tick() {
 	)
 
 	if !cfg.Enabled {
+		c.garoCache.SetDeepIdle(false)
+		// Force a fresh idle/safe-current transition if automatic control is
+		// enabled again later; another mode may have changed the DLM setting.
+		c.safeApplied = false
 		s.State = "disabled"
 		s.Decision = "controller disabled"
 		c.setSnapshot(s)
@@ -1094,6 +1254,10 @@ func (c *EnergyController) tick() {
 	}
 
 	if cfg.Mode != "automatic" {
+		c.garoCache.SetDeepIdle(false)
+		// Do not carry a deep-idle assumption across manual/other modes because
+		// those modes can legitimately alter the current limit.
+		c.safeApplied = false
 		s.State = cfg.Mode
 		s.Decision = "automatic controller not active"
 		c.setSnapshot(s)
@@ -1144,6 +1308,7 @@ func (c *EnergyController) tick() {
 						cfg.SafeCurrentA,
 					)
 					c.safeApplied = true
+					c.garoCache.SetDeepIdle(true)
 				}
 			} else {
 				s.Decision = "safe current already restored"
@@ -1161,6 +1326,7 @@ func (c *EnergyController) tick() {
 
 	c.idleSince = time.Time{}
 	c.safeApplied = false
+	c.garoCache.SetDeepIdle(false)
 
 	if !valid {
 		s.State = "fallback-safe"

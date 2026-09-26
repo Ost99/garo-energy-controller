@@ -978,21 +978,21 @@ const statusPage = `<!doctype html>
             <div class="status-item"><span class="label">GARO</span><span id="garo">...</span></div>
             <div class="status-item"><span class="label">Tibber</span><span id="tibber">...</span></div>
             <div class="status-item"><span class="label">Tibber home</span><span id="tibberHome">...</span></div>
-            <div class="status-item"><span class="label">Control source</span><span id="controlSource">...</span></div>
+            <div class="status-item charging-only"><span class="label">Control source</span><span id="controlSource">...</span></div>
             <div class="status-item"><span class="label">Grid import now</span><span id="tibberPower">...</span></div>
             <div class="status-item"><span class="label">Grid export now</span><span id="tibberProduction">...</span></div>
             <div class="status-item"><span class="label">Imported this hour</span><span id="tibberHour">...</span></div>
-            <div class="status-item"><span class="label">Controller hour energy</span><span id="hourEnergy">...</span></div>
-            <div class="status-item"><span class="label">Expected energy by now</span><span id="expectedHourEnergy">...</span></div>
-            <div class="status-item"><span class="label">Energy pacing error</span><span id="pacingError">...</span></div>
-            <div class="status-item"><span class="label">Remaining allowance</span><span id="remainingEnergy">...</span></div>
-            <div class="status-item"><span class="label">Base target</span><span id="baseTargetPower">...</span></div>
-            <div class="status-item"><span class="label">Pacing correction</span><span id="pacingCorrection">...</span></div>
-            <div class="status-item"><span class="label">Pacing target</span><span id="pacingTarget">...</span></div>
-            <div class="status-item"><span class="label">Hard budget ceiling</span><span id="hardBudgetCeiling">...</span></div>
-            <div class="status-item"><span class="label">Effective target</span><span id="allowedPower">...</span></div>
-            <div class="status-item"><span class="label">Power headroom</span><span id="powerHeadroom">...</span></div>
-            <div class="status-item"><span class="label">Last DLM adjustment</span><span id="lastAdjustment">...</span></div>
+            <div class="status-item charging-only"><span class="label">Controller hour energy</span><span id="hourEnergy">...</span></div>
+            <div class="status-item charging-only"><span class="label">Expected energy by now</span><span id="expectedHourEnergy">...</span></div>
+            <div class="status-item charging-only"><span class="label">Energy pacing error</span><span id="pacingError">...</span></div>
+            <div class="status-item charging-only"><span class="label">Remaining allowance</span><span id="remainingEnergy">...</span></div>
+            <div class="status-item charging-only"><span class="label">Base target</span><span id="baseTargetPower">...</span></div>
+            <div class="status-item charging-only"><span class="label">Pacing correction</span><span id="pacingCorrection">...</span></div>
+            <div class="status-item charging-only"><span class="label">Pacing target</span><span id="pacingTarget">...</span></div>
+            <div class="status-item charging-only"><span class="label">Hard budget ceiling</span><span id="hardBudgetCeiling">...</span></div>
+            <div class="status-item charging-only"><span class="label">Effective target</span><span id="allowedPower">...</span></div>
+            <div class="status-item charging-only"><span class="label">Power headroom</span><span id="powerHeadroom">...</span></div>
+            <div class="status-item charging-only"><span class="label">Last DLM adjustment</span><span id="lastAdjustment">...</span></div>
             <div class="status-item"><span class="label">Tibber data age</span><span id="tibberAge">...</span></div>
             <div class="status-item"><span class="label">Tibber API requests</span><span id="tibberApiRequests">...</span></div>
             <div class="status-item"><span class="label">Last API request</span><span id="tibberApiLast">...</span></div>
@@ -1048,6 +1048,12 @@ async function refreshStatus() {
         const t = s.tibber || {};
         const c = s.controller || {};
 
+
+        const charging = c.central101_valid && c.charging;
+
+        document.querySelectorAll(".charging-only").forEach(function (row) {
+            row.hidden = !charging;
+        });
         setText("garo", s.garo_online ? "Online" : "Offline");
         setText("fuse100", s.load_balancing_fuse !== undefined ? s.load_balancing_fuse + " A" + staleSuffix(c.dlm_config_stale) : "-");
         setText("fuse101", s.load_balancing_fuse_101 !== undefined ? s.load_balancing_fuse_101 + " A" + staleSuffix(c.dlm_config_stale) : "-");
