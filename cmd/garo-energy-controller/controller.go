@@ -4,12 +4,18 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
 
-const chargingThresholdA = 2.0
+const (
+	chargingThresholdA = 2.0
+	hardStopLeadTime   = 180 * time.Second
+	hardStopStatePath  = "/var/lib/garo-energy-controller/hard-stop"
+)
 
 func controlRefreshProblem(refresh GaroMeterRefreshResult, s GaroCacheSnapshot) string {
 	parts := make([]string, 0, 3)
@@ -156,6 +162,9 @@ type EnergyController struct {
 	lastAdjustmentDelta int
 	manualHoldUntil     time.Time
 
+	hardStopped  bool
+	hardStopHour time.Time
+
 	fallbackValid         bool
 	fallbackHour          time.Time
 	fallbackEnergyKWh     float64
@@ -169,11 +178,15 @@ func NewEnergyController(
 	tibber *TibberClient,
 	getConfig func() Config,
 ) *EnergyController {
+	hardStopHour, hardStopped := loadHardStopState()
+
 	return &EnergyController{
-		garo:      garo,
-		garoCache: garoCache,
-		tibber:    tibber,
-		getConfig: getConfig,
+		garo:         garo,
+		garoCache:    garoCache,
+		tibber:       tibber,
+		getConfig:    getConfig,
+		hardStopped:  hardStopped,
+		hardStopHour: hardStopHour,
 	}
 }
 
@@ -482,6 +495,99 @@ func (c *EnergyController) manualHoldRemaining(now time.Time) time.Duration {
 	return until.Sub(now)
 }
 
+func loadHardStopState() (time.Time, bool) {
+	data, err := os.ReadFile(hardStopStatePath)
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	hour, err := time.Parse(time.RFC3339, strings.TrimSpace(string(data)))
+	if err != nil {
+		// Treat a malformed marker conservatively as an active stale hard stop.
+		// The first trustworthy automatic-control tick will release it.
+		return time.Time{}, true
+	}
+
+	return hour, true
+}
+
+func persistHardStopState(hour time.Time) error {
+	if err := os.MkdirAll(filepath.Dir(hardStopStatePath), 0o755); err != nil {
+		return err
+	}
+
+	return os.WriteFile(
+		hardStopStatePath,
+		[]byte(hour.Format(time.RFC3339)+"\n"),
+		0o644,
+	)
+}
+
+func clearHardStopState() error {
+	err := os.Remove(hardStopStatePath)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (c *EnergyController) activateHardStop(hour time.Time) error {
+	// Persist ownership before changing GARO availability. If the controller
+	// process restarts after ALWAYS_OFF, the next instance can still release it
+	// at the hour boundary instead of leaving charging disabled indefinitely.
+	if err := persistHardStopState(hour); err != nil {
+		return fmt.Errorf("persist hard-stop state: %w", err)
+	}
+
+	if err := c.garo.SetChargeMode("ALWAYS_OFF"); err != nil {
+		_ = clearHardStopState()
+		return err
+	}
+
+	c.garoCache.NoteChargeMode("ALWAYS_OFF")
+	c.hardStopped = true
+	c.hardStopHour = hour
+	return nil
+}
+
+func (c *EnergyController) releaseHardStop() error {
+	if err := c.garo.SetChargeMode("ALWAYS_ON"); err != nil {
+		return err
+	}
+
+	if err := clearHardStopState(); err != nil {
+		// Keep the persistent marker and the GARO state consistent. If possible,
+		// roll availability back to ALWAYS_OFF and retry the release next tick.
+		if rollbackErr := c.garo.SetChargeMode("ALWAYS_OFF"); rollbackErr == nil {
+			c.garoCache.NoteChargeMode("ALWAYS_OFF")
+		}
+		return fmt.Errorf("clear hard-stop state: %w", err)
+	}
+
+	c.garoCache.NoteChargeMode("ALWAYS_ON")
+	c.hardStopped = false
+	c.hardStopHour = time.Time{}
+	return nil
+}
+
+func hardStopRequired(s ControllerSnapshot) bool {
+	if !s.EnergyValid || !s.Charging {
+		return false
+	}
+
+	if s.RemainingEnergyKWh <= 0 {
+		return true
+	}
+
+	powerKW := math.Max(s.GridPowerW, 0) / 1000.0
+	if powerKW <= 0 {
+		return false
+	}
+
+	secondsToLimit := s.RemainingEnergyKWh / powerKW * 3600.0
+	return secondsToLimit <= hardStopLeadTime.Seconds()
+}
+
 func requiredUpDwell(
 	headroomW float64,
 	upGateW float64,
@@ -751,6 +857,17 @@ func (c *EnergyController) tick() {
 		// Force a fresh idle/safe-current transition if automatic control is
 		// enabled again later; another mode may have changed the DLM setting.
 		c.safeApplied = false
+
+		if c.hardStopped {
+			if err := c.releaseHardStop(); err != nil {
+				s.State = "hard-stop"
+				s.Error = err.Error()
+				s.Decision = "failed to release hard stop while disabling controller"
+				c.setSnapshot(s)
+				return
+			}
+		}
+
 		s.State = "disabled"
 		s.Decision = "controller disabled"
 		c.setSnapshot(s)
@@ -762,8 +879,64 @@ func (c *EnergyController) tick() {
 		// Do not carry a deep-idle assumption across manual/other modes because
 		// those modes can legitimately alter the current limit.
 		c.safeApplied = false
+
+		if c.hardStopped {
+			if err := c.releaseHardStop(); err != nil {
+				s.State = "hard-stop"
+				s.Error = err.Error()
+				s.Decision = "failed to release hard stop while leaving automatic mode"
+				c.setSnapshot(s)
+				return
+			}
+		}
+
 		s.State = cfg.Mode
 		s.Decision = "automatic controller not active"
+		c.setSnapshot(s)
+		return
+	}
+
+	// A controller-created hard stop must be handled before session-idle logic.
+	// Once ALWAYS_OFF takes effect CENTRAL101 reports no charging, so waiting
+	// until the normal automatic-control section would make the hour-boundary
+	// release unreachable.
+	if c.hardStopped {
+		s.State = "hard-stop"
+
+		if !valid {
+			s.Decision = "hard stop active; waiting for trustworthy hour boundary"
+			c.setSnapshot(s)
+			return
+		}
+
+		if hourStart(referenceTime).Equal(c.hardStopHour) {
+			// If an external/manual action changed availability while the controller
+			// owns the hard stop, reassert it. Disabling automatic mode is the clean
+			// way to take control away from the hourly hard-stop state.
+			if garoState.ChargeModeValid && garoState.ChargeMode != "ALWAYS_OFF" {
+				if err := c.garo.SetChargeMode("ALWAYS_OFF"); err != nil {
+					s.Error = err.Error()
+					s.Decision = "failed to reassert hourly hard stop"
+					c.setSnapshot(s)
+					return
+				}
+				c.garoCache.NoteChargeMode("ALWAYS_OFF")
+			}
+
+			s.Decision = "hard stop active until next hour"
+			c.setSnapshot(s)
+			return
+		}
+
+		if err := c.releaseHardStop(); err != nil {
+			s.Error = err.Error()
+			s.Decision = "failed to release hourly hard stop"
+			c.setSnapshot(s)
+			return
+		}
+
+		s.State = "automatic"
+		s.Decision = "new hour: released hard stop"
 		c.setSnapshot(s)
 		return
 	}
@@ -862,6 +1035,22 @@ func (c *EnergyController) tick() {
 		return
 	}
 
+	if hardStopRequired(s) {
+		if err := c.activateHardStop(hourStart(referenceTime)); err != nil {
+			s.Error = err.Error()
+			s.Decision = "hard stop failed"
+		} else {
+			s.State = "hard-stop"
+			s.Decision = fmt.Sprintf(
+				"hard stop: hourly target predicted within %d seconds",
+				int(hardStopLeadTime.Seconds()),
+			)
+		}
+
+		c.setSnapshot(s)
+		return
+	}
+
 	remainingEnergy := s.RemainingEnergyKWh
 	allowedPower := s.AllowedAveragePowerW
 	headroomW := s.PowerHeadroomW
@@ -871,8 +1060,9 @@ func (c *EnergyController) tick() {
 	target := currentLimit
 	step := 0
 
-	// If the hourly budget is exhausted, move directly to the configured
-	// minimum. The future hard-stop/availability action remains separate.
+	// Defensive fallback: when charging is active, hardStopRequired() above
+	// handles an exhausted hourly budget by disabling charging. Keep the
+	// minimum-current path for any edge case that reaches this point.
 	if remainingEnergy <= 0 {
 		target = cfg.MinimumCurrentA
 		s.Decision = "hourly budget exhausted"
@@ -988,12 +1178,17 @@ func (c *EnergyController) tick() {
 				)
 			}
 
-		case unusedDLMHeadroomA > cfg.ControlTuning.UnusedDLMHeadroomA:
-			// Nearer the target, do not increase while GARO still has unused
-			// current authority from the existing DLM setting.
+		case unusedDLMHeadroomA > cfg.ControlTuning.UnusedDLMHeadroomA &&
+			adjustmentAge < normalDwell:
+			// Unused DLM headroom is a useful response signal immediately after a
+			// DLM change, but GARO can retain a small steady-state margin below the
+			// configured ceiling. Do not let that residual margin permanently veto
+			// a real power deficit once the normal response dwell has elapsed.
 			s.Decision = fmt.Sprintf(
-				"hold increase: GARO still has %.1f A unused DLM headroom",
+				"hold increase: GARO still has %.1f A unused DLM headroom; waiting for previous DLM change (%ds/%ds)",
 				unusedDLMHeadroomA,
+				int(adjustmentAge.Seconds()),
+				int(normalDwell.Seconds()),
 			)
 
 		default:
