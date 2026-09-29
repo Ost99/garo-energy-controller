@@ -1,0 +1,171 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+    font-family: Arial, Helvetica, sans-serif;
+    background: #f7f7f7;
+    color: #111;
+    font-size: 14px;
+}
+.topbar {
+    height: 46px;
+    background: #e9e9e9;
+    border-bottom: 1px solid #d5d5d5;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #444;
+    font-size: 13px;
+}
+.garo-icon-button {
+    position: absolute;
+    left: 8px;
+    top: 8px;
+    display: block;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    overflow: hidden;
+    text-indent: -9999px;
+    white-space: nowrap;
+    border: 1px solid #c8c8c8;
+    border-radius: 16px;
+    background: linear-gradient(#fff, #ededed);
+    box-shadow: 0 1px 2px rgba(0,0,0,.18);
+}
+.garo-icon-button:hover { background: #f4f4f4; }
+.garo-icon-button:after {
+    content: "";
+    position: absolute;
+    display: block;
+    width: 22px;
+    height: 22px;
+    left: 50%;
+    top: 50%;
+    margin-left: -11px;
+    margin-top: -11px;
+    background-color: #777;
+    background-color: rgba(0,0,0,.42);
+    background-position: center center;
+    background-repeat: no-repeat;
+    border-radius: 12px;
+}
+.page {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 16px 16px 40px;
+}
+.logo-wrap {
+    text-align: center;
+    padding: 0 0 20px;
+    user-select: none;
+}
+#garoLogo {
+    width: 110px;
+    max-height: 62px;
+    object-fit: contain;
+    user-select: none;
+    -webkit-user-drag: none;
+}
+.status-strip {
+    background: #ececec;
+    border: 1px solid #d6d6d6;
+    border-radius: 5px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.12);
+    text-align: center;
+    font-weight: bold;
+    font-size: 16px;
+    padding: 12px 42px;
+    margin-bottom: 26px;
+}
+.section-label {
+    font-weight: bold;
+    font-size: 16px;
+    margin: 0 0 10px;
+}
+.panel {
+    background: #fff;
+    border: 1px solid #d5d5d5;
+    border-radius: 5px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.12);
+    margin-bottom: 16px;
+    overflow: hidden;
+}
+.panel-title {
+    background: linear-gradient(#fff, #f3f3f3);
+    border-bottom: 1px solid #ddd;
+    font-weight: bold;
+    font-size: 16px;
+    padding: 12px 16px;
+}
+.panel-body { padding: 14px 16px; }
+.device-row {
+    display: grid;
+    grid-template-columns: 76px minmax(0, 1fr);
+    gap: 14px;
+    align-items: center;
+    padding: 10px 8px;
+}
+.device-row + .device-row { border-top: 1px solid #ddd; }
+.device-icon {
+    width: 56px;
+    max-height: 82px;
+    object-fit: contain;
+    justify-self: center;
+}
+.device-name {
+    font-weight: bold;
+    font-size: 15px;
+    margin-bottom: 6px;
+}
+.data-line { margin: 4px 0; line-height: 1.35; }
+.data-label { font-weight: bold; }
+.status-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(280px, 1fr));
+    column-gap: 34px;
+    row-gap: 7px;
+}
+.status-item {
+    display: grid;
+    grid-template-columns: 190px minmax(0, 1fr);
+    gap: 10px;
+}
+.status-item .label { font-weight: bold; }
+.config-grid {
+    display: grid;
+    grid-template-columns: 280px max-content;
+    gap: 10px 20px;
+    align-items: center;
+}
+.config-grid > div { white-space: nowrap; }
+input[type="number"], input[type="text"], select {
+    width: 150px;
+    padding: 6px 7px;
+    border: 1px solid #bbb;
+    border-radius: 3px;
+    background: #fff;
+}
+input[type="checkbox"] { transform: translateY(1px); }
+.actions { margin-top: 18px; }
+button {
+    padding: 8px 14px;
+    margin: 0 8px 0 0;
+    border: 1px solid #aaa;
+    border-radius: 4px;
+    background: linear-gradient(#fff, #e9e9e9);
+    cursor: pointer;
+}
+button:hover { background: #eee; }
+.note { color: #666; font-size: 12px; margin-top: 12px; }
+.current-value { color: #666; margin-left: 8px; font-size: 12px; }
+#message { color: #087b12; }
+#error { color: #a00; white-space: pre-wrap; }
+.advanced .panel-title { background: #f2f2f2; }
+[hidden] { display: none !important; }
+@media (max-width: 760px) {
+    .status-grid { grid-template-columns: 1fr; }
+    .status-item { grid-template-columns: 165px minmax(0, 1fr); }
+    .config-grid { grid-template-columns: 1fr; gap: 4px; }
+    .config-grid label { margin-top: 8px; }
+}

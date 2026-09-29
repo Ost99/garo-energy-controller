@@ -663,12 +663,15 @@ func (t *TibberClient) connectOnce(
 		return false, err
 	}
 
-	// Wait for connection_ack before subscribing.
+	// Wait for connection_ack before subscribing. Tibber may send protocol
+	// pings first, so keep consuming initialization messages until the
+	// connection moves into the acknowledged state.
 	conn.SetReadDeadline(
 		time.Now().Add(10 * time.Second),
 	)
 
-	for {
+	acknowledged := false
+	for !acknowledged {
 		var message tibberWSMessage
 
 		if err := conn.ReadJSON(&message); err != nil {
@@ -677,7 +680,7 @@ func (t *TibberClient) connectOnce(
 
 		switch message.Type {
 		case "connection_ack":
-			goto acknowledged
+			acknowledged = true
 
 		case "ping":
 			if err := t.sendPong(
@@ -694,8 +697,6 @@ func (t *TibberClient) connectOnce(
 			)
 		}
 	}
-
-acknowledged:
 
 	subscription := `
 subscription LiveMeasurement($homeId: ID!) {
