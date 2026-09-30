@@ -13,8 +13,15 @@ import (
 
 const (
 	chargingThresholdA = 2.0
-	hardStopLeadTime   = 180 * time.Second
-	hardStopStatePath  = "/var/lib/garo-energy-controller/hard-stop"
+
+	// A small residual DLM margin is normal on this GARO installation and must
+	// not permanently block upward control. A large margin, however, means GARO
+	// already has substantial unused authority and another DLM increase would
+	// only move the ceiling without increasing charging.
+	largeUnusedDLMHeadroomA = 4.0
+
+	hardStopLeadTime  = 180 * time.Second
+	hardStopStatePath = "/var/lib/garo-energy-controller/hard-stop"
 )
 
 func controlRefreshProblem(refresh GaroMeterRefreshResult, s GaroCacheSnapshot) string {
@@ -33,6 +40,40 @@ func controlRefreshProblem(refresh GaroMeterRefreshResult, s GaroCacheSnapshot) 
 		parts = append(parts, "DLM configuration stale")
 	}
 	return strings.Join(parts, ", ")
+}
+
+func chargerLoadBalancingDiagnostics(
+	pilots []GaroPilotLevel,
+	pilotValid bool,
+	pilotStale bool,
+) (valid bool, allBalanced bool, configError string) {
+	if !pilotValid || pilotStale || len(pilots) == 0 {
+		return false, false, ""
+	}
+
+	notBalanced := make([]string, 0, len(pilots))
+	unknown := false
+	for _, pilot := range pilots {
+		if !pilot.LoadBalancedKnown {
+			unknown = true
+			continue
+		}
+		if !pilot.LoadBalanced {
+			notBalanced = append(notBalanced, fmt.Sprintf("%d", pilot.SerialNumber))
+		}
+	}
+
+	if len(notBalanced) > 0 {
+		return true, false, fmt.Sprintf(
+			"GARO configuration error: charger(s) %s not load balanced",
+			strings.Join(notBalanced, ", "),
+		)
+	}
+	if unknown {
+		return false, false, ""
+	}
+
+	return true, true, ""
 }
 
 func mergeGaroDiagnostics(s *ControllerSnapshot, g GaroCacheSnapshot) {
@@ -79,6 +120,14 @@ func mergeGaroDiagnostics(s *ControllerSnapshot, g GaroCacheSnapshot) {
 	if g.PilotValid {
 		s.PilotLevels = append([]GaroPilotLevel(nil), g.PilotLevels...)
 	}
+
+	s.ChargerLoadBalancingValid,
+		s.AllChargersLoadBalanced,
+		s.ChargerLoadBalancingError = chargerLoadBalancingDiagnostics(
+		s.PilotLevels,
+		s.PilotValid,
+		s.PilotStale,
+	)
 }
 
 type ControllerSnapshot struct {
@@ -94,6 +143,10 @@ type ControllerSnapshot struct {
 	PilotAgeSeconds int64            `json:"pilot_age_seconds,omitempty"`
 	PilotStale      bool             `json:"pilot_stale"`
 	PilotError      string           `json:"pilot_error,omitempty"`
+
+	ChargerLoadBalancingValid bool   `json:"charger_load_balancing_valid"`
+	AllChargersLoadBalanced   bool   `json:"all_chargers_load_balanced"`
+	ChargerLoadBalancingError string `json:"charger_load_balancing_error,omitempty"`
 
 	HourEnergyKWh         float64 `json:"hour_energy_kwh"`
 	RemainingEnergyKWh    float64 `json:"remaining_energy_kwh"`
@@ -435,6 +488,43 @@ func phaseMode(m GaroMeterInfo) string {
 	return "three-phase"
 }
 
+func activePilotsSaturated(s ControllerSnapshot) (bool, string) {
+	if !s.PilotValid || s.PilotStale {
+		return false, ""
+	}
+
+	active := 0
+	details := make([]string, 0, len(s.PilotLevels))
+	for _, pilot := range s.PilotLevels {
+		// GARO normally reports Connector=CHARGING for an EVSE that is actually
+		// delivering power, but this firmware can report another connector state
+		// while a slave is visibly drawing current. A pilot above the normal 6 A
+		// minimum is therefore also treated as active while the group is charging.
+		// This keeps an idle 6 A EVSE from preventing saturation detection on the
+		// charger that is actually at (for example) 29/29 A.
+		isActive := pilot.Charging || (s.Charging && pilot.PilotA > 6)
+		if !isActive {
+			continue
+		}
+
+		active++
+		if pilot.MaxPilotA <= 0 || !pilot.Saturated {
+			return false, ""
+		}
+
+		details = append(details, fmt.Sprintf(
+			"%d %d/%d A",
+			pilot.SerialNumber,
+			pilot.PilotA,
+			pilot.MaxPilotA,
+		))
+	}
+
+	if active == 0 {
+		return false, ""
+	}
+	return true, strings.Join(details, ", ")
+}
 func (c *EnergyController) noteAdjustment(now time.Time, delta int) {
 	c.adjustmentMu.Lock()
 	defer c.adjustmentMu.Unlock()
@@ -948,6 +1038,41 @@ func (c *EnergyController) tick() {
 		return
 	}
 
+	// The hourly hard stop is independent of GARO DLM/load-balancing mode.
+	// ALWAYS_OFF remains effective even when one charger is not participating
+	// in DLM, so evaluate this before suspending DLM regulation.
+	if hardStopRequired(s) {
+		if err := c.activateHardStop(hourStart(referenceTime)); err != nil {
+			s.Error = err.Error()
+			s.Decision = "hard stop failed"
+		} else {
+			s.State = "hard-stop"
+			s.Decision = fmt.Sprintf(
+				"hard stop: hourly target predicted within %d seconds",
+				int(hardStopLeadTime.Seconds()),
+			)
+		}
+
+		c.setSnapshot(s)
+		return
+	}
+
+	// DLM current changes are only meaningful when every reported charger is
+	// participating in GARO load balancing. Keep polling so recovery is detected,
+	// but do not write CENTRAL100 while this invariant is false or unverifiable.
+	if !s.ChargerLoadBalancingValid {
+		s.State = "configuration-hold"
+		s.Decision = "GARO charger load-balancing status unavailable; DLM regulation suspended; hard stop remains armed"
+		c.setSnapshot(s)
+		return
+	}
+	if !s.AllChargersLoadBalanced {
+		s.State = "configuration-fault"
+		s.Decision = s.ChargerLoadBalancingError + "; DLM regulation suspended; hard stop remains armed"
+		c.setSnapshot(s)
+		return
+	}
+
 	// Session idle handling.
 	if !s.Charging {
 		s.State = "idle"
@@ -1035,22 +1160,6 @@ func (c *EnergyController) tick() {
 		return
 	}
 
-	if hardStopRequired(s) {
-		if err := c.activateHardStop(hourStart(referenceTime)); err != nil {
-			s.Error = err.Error()
-			s.Decision = "hard stop failed"
-		} else {
-			s.State = "hard-stop"
-			s.Decision = fmt.Sprintf(
-				"hard stop: hourly target predicted within %d seconds",
-				int(hardStopLeadTime.Seconds()),
-			)
-		}
-
-		c.setSnapshot(s)
-		return
-	}
-
 	remainingEnergy := s.RemainingEnergyKWh
 	allowedPower := s.AllowedAveragePowerW
 	headroomW := s.PowerHeadroomW
@@ -1116,6 +1225,7 @@ func (c *EnergyController) tick() {
 			unusedDLMHeadroomA = 0
 		}
 		normalDwell := time.Duration(cfg.ControlTuning.NormalDwellSeconds) * time.Second
+		pilotsSaturated, saturationSummary := activePilotsSaturated(s)
 
 		switch {
 		case headroomW < upGateW:
@@ -1124,6 +1234,26 @@ func (c *EnergyController) tick() {
 				headroomW,
 				s.PhaseMode,
 				upGateW,
+			)
+
+		case pilotsSaturated:
+			// Every EVSE that GARO reports as actively charging has reached its own
+			// immutable pilot ceiling discovered from the GARO API at startup. More
+			// LB100 authority cannot increase charging power in this state.
+			s.Decision = fmt.Sprintf(
+				"hold increase: active GARO pilots saturated (%s); %.1f A unused DLM headroom",
+				saturationSummary,
+				unusedDLMHeadroomA,
+			)
+
+		case unusedDLMHeadroomA >= largeUnusedDLMHeadroomA:
+			// Large unused authority is not the small steady-state GARO reserve.
+			// Wait indefinitely for GARO/load to consume it instead of ratcheting
+			// LB100 upward every time the dwell expires.
+			s.Decision = fmt.Sprintf(
+				"hold increase: GARO has %.1f A unused DLM headroom (large-headroom guard %.1f A)",
+				unusedDLMHeadroomA,
+				largeUnusedDLMHeadroomA,
 			)
 
 		case headroomW > calculatedThresholdW:

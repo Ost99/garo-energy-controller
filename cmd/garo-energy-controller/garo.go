@@ -25,16 +25,303 @@ const (
 	// consumption, not net grid import.
 	fallbackVoltage = 230.0
 
-	garoStaleAfter             = 60 * time.Second
-	garoFastPollInterval       = 5 * time.Second
-	garoDeepIdlePollInterval   = 30 * time.Second
-	garoDeepIdleLBPollInterval = 60 * time.Second
+	// GARO packs the SW2 1-3 current-selector switches into bits 5-7 of
+	// dipSwitchSettings. The current table is the one printed by GARO for
+	// GLB/GLBDC chargers. The mapping is intentionally decoded from the bit
+	// field instead of hard-coding charger serial numbers.
+	garoSW2CurrentMask  = 0xE0
+	garoSW2CurrentShift = 5
+
+	garoStaleAfter              = 60 * time.Second
+	garoFastPollInterval        = 5 * time.Second
+	garoDeepIdlePollInterval    = 30 * time.Second
+	garoDeepIdleLBPollInterval  = 60 * time.Second
+	garoCapabilityRetryInterval = 30 * time.Second
 )
 
 type GaroClient struct {
 	baseURL string
 	client  *http.Client
 	mu      sync.Mutex
+
+	// Charger limits are static hardware/configuration capabilities. Discover
+	// them at most once per process startup and reuse them for every fast poll.
+	capabilitiesLoaded      bool
+	capabilities            GaroCapabilities
+	capabilitiesErr         error
+	capabilitiesNextAttempt time.Time
+}
+
+type GaroChargerCapability struct {
+	SerialNumber int `json:"serial_number"`
+	MaxPilotA    int `json:"max_pilot_a"`
+}
+
+type GaroCapabilities struct {
+	Chargers map[int]GaroChargerCapability
+}
+
+func (c GaroCapabilities) MaxPilotA(serialNumber int) int {
+	if serialNumber == 0 || c.Chargers == nil {
+		return 0
+	}
+	return c.Chargers[serialNumber].MaxPilotA
+}
+
+func cloneGaroCapabilities(c GaroCapabilities) GaroCapabilities {
+	out := GaroCapabilities{
+		Chargers: make(map[int]GaroChargerCapability, len(c.Chargers)),
+	}
+	for serial, capability := range c.Chargers {
+		out.Chargers[serial] = capability
+	}
+	return out
+}
+
+func minPositive(values ...int) int {
+	result := 0
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if result == 0 || value < result {
+			result = value
+		}
+	}
+	return result
+}
+
+// decodeGaroSW2MaxPilotA extracts the EVSE's static pilot ceiling from the
+// packed dipSwitchSettings value returned for GARO group members.
+//
+// GARO's SW2 1-3 current table is:
+//
+//	code 000 = 29 A
+//	code 001 =  6 A
+//	code 010 = 10 A
+//	code 011 = 13 A
+//	code 100 = 16 A
+//	code 101 = 20 A
+//	code 110 = 25 A
+//	code 111 = 32 A
+//
+// The bit placement is also verified on this firmware by observed values:
+// 7689 -> 000 -> 29 A, 7881 -> 110 -> 25 A, 7913/7929 -> 111 -> 32 A.
+// Other DIP switches may change other bits in dipSwitchSettings; masking 0xE0
+// keeps those settings independent of the pilot-current decoder.
+func decodeGaroSW2MaxPilotA(dipSwitchSettings int) int {
+	if dipSwitchSettings <= 0 {
+		return 0
+	}
+
+	code := (dipSwitchSettings & garoSW2CurrentMask) >> garoSW2CurrentShift
+	switch code {
+	case 0:
+		return 29
+	case 1:
+		return 6
+	case 2:
+		return 10
+	case 3:
+		return 13
+	case 4:
+		return 16
+	case 5:
+		return 20
+	case 6:
+		return 25
+	case 7:
+		return 32
+	default:
+		return 0
+	}
+}
+
+type garoCapabilityCharger struct {
+	SerialNumber        int `json:"serialNumber"`
+	MaxChargeCurrent    int `json:"maxChargeCurrent"`
+	FactoryChargeLimit  int `json:"factoryChargeLimit"`
+	SwitchChargeLimit   int `json:"switchChargeLimit"`
+	FactoryCurrentLimit int `json:"factoryCurrentLimit"`
+	SwitchCurrentLimit  int `json:"switchCurrentLimit"`
+	MaxCurrent          int `json:"maxCurrent"`
+	MaxCurrentLimit     int `json:"maxCurrentLimit"`
+	DipSwitchSettings   int `json:"dipSwitchSettings"`
+}
+
+func (c garoCapabilityCharger) maxPilotA() int {
+	return minPositive(
+		c.MaxChargeCurrent,
+		c.FactoryChargeLimit,
+		c.SwitchChargeLimit,
+		c.FactoryCurrentLimit,
+		c.SwitchCurrentLimit,
+		c.MaxCurrent,
+		c.MaxCurrentLimit,
+		decodeGaroSW2MaxPilotA(c.DipSwitchSettings),
+	)
+}
+
+func addGaroChargerCapability(
+	chargers map[int]GaroChargerCapability,
+	serialNumber int,
+	maxPilotA int,
+) {
+	if serialNumber == 0 || maxPilotA <= 0 {
+		return
+	}
+
+	if existing, ok := chargers[serialNumber]; ok && existing.MaxPilotA > 0 {
+		// When multiple GARO endpoints describe the same EVSE, the lowest
+		// positive static limit is the safe effective pilot ceiling.
+		maxPilotA = minPositive(existing.MaxPilotA, maxPilotA)
+	}
+
+	chargers[serialNumber] = GaroChargerCapability{
+		SerialNumber: serialNumber,
+		MaxPilotA:    maxPilotA,
+	}
+}
+
+func rawIntByNames(values map[string]json.RawMessage, names ...string) int {
+	for _, name := range names {
+		if value := rawInt(values[name]); value != nil && *value > 0 {
+			return *value
+		}
+	}
+	return 0
+}
+
+func (g *GaroClient) getJSONBody(path string) ([]byte, error) {
+	resp, err := g.client.Get(g.baseURL + path)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf(
+			"GET %s: HTTP %d: %s",
+			strings.TrimPrefix(path, "/"),
+			resp.StatusCode,
+			string(body),
+		)
+	}
+	return body, nil
+}
+
+func (g *GaroClient) discoverCapabilitiesLocked() (GaroCapabilities, error) {
+	caps := GaroCapabilities{
+		Chargers: make(map[int]GaroChargerCapability),
+	}
+	problems := make([]string, 0, 3)
+
+	// /status gives the master serial plus its explicit factory/switch limit.
+	// mainCharger also carries the packed DIP value, which is useful on firmware
+	// variants where one of the explicit fields is absent.
+	if body, err := g.getJSONBody("/status"); err != nil {
+		problems = append(problems, "status: "+err.Error())
+	} else {
+		var status struct {
+			SerialNumber        int                   `json:"serialNumber"`
+			FactoryCurrentLimit int                   `json:"factoryCurrentLimit"`
+			SwitchCurrentLimit  int                   `json:"switchCurrentLimit"`
+			MainCharger         garoCapabilityCharger `json:"mainCharger"`
+		}
+		if err := json.Unmarshal(body, &status); err != nil {
+			problems = append(problems, "status decode: "+err.Error())
+		} else {
+			mainSerial := status.SerialNumber
+			if status.MainCharger.SerialNumber != 0 {
+				mainSerial = status.MainCharger.SerialNumber
+			}
+			addGaroChargerCapability(
+				caps.Chargers,
+				mainSerial,
+				minPositive(
+					status.FactoryCurrentLimit,
+					status.SwitchCurrentLimit,
+					status.MainCharger.maxPilotA(),
+				),
+			)
+		}
+	}
+
+	// /slaves/false is actually the group-member list on this firmware: it
+	// includes both master and slave EVSEs. Decode SW2 per serial so every
+	// charger gets its own immutable pilot ceiling.
+	if body, err := g.getJSONBody("/slaves/false"); err != nil {
+		problems = append(problems, "slaves: "+err.Error())
+	} else {
+		var members []garoCapabilityCharger
+		if err := json.Unmarshal(body, &members); err != nil {
+			problems = append(problems, "slaves decode: "+err.Error())
+		} else {
+			for _, member := range members {
+				addGaroChargerCapability(
+					caps.Chargers,
+					member.SerialNumber,
+					member.maxPilotA(),
+				)
+			}
+		}
+	}
+
+	if len(caps.Chargers) == 0 {
+		problems = append(problems, "no charger pilot limits discovered")
+	}
+	if len(problems) > 0 {
+		return caps, fmt.Errorf("GARO capability discovery: %s", strings.Join(problems, "; "))
+	}
+	return caps, nil
+}
+
+func mergeGaroCapabilities(dst, src GaroCapabilities) GaroCapabilities {
+	if dst.Chargers == nil {
+		dst.Chargers = make(map[int]GaroChargerCapability)
+	}
+	for serial, capability := range src.Chargers {
+		if capability.MaxPilotA > 0 {
+			dst.Chargers[serial] = capability
+		}
+	}
+	return dst
+}
+
+func (g *GaroClient) getCapabilitiesLocked() (GaroCapabilities, error) {
+	if g.capabilitiesLoaded {
+		return cloneGaroCapabilities(g.capabilities), g.capabilitiesErr
+	}
+
+	now := time.Now()
+	if !g.capabilitiesNextAttempt.IsZero() && now.Before(g.capabilitiesNextAttempt) {
+		return cloneGaroCapabilities(g.capabilities), g.capabilitiesErr
+	}
+
+	discovered, err := g.discoverCapabilitiesLocked()
+	g.capabilities = mergeGaroCapabilities(g.capabilities, discovered)
+	g.capabilitiesErr = err
+
+	if err == nil && len(g.capabilities.Chargers) > 0 {
+		g.capabilitiesLoaded = true
+		g.capabilitiesNextAttempt = time.Time{}
+	} else {
+		// A transient SerialService/startup failure must not permanently cache
+		// zero/unknown capabilities. Retry later, but not on every 5 s fast poll.
+		g.capabilitiesNextAttempt = now.Add(garoCapabilityRetryInterval)
+	}
+
+	return cloneGaroCapabilities(g.capabilities), g.capabilitiesErr
+}
+
+func (g *GaroClient) GetCapabilities() (GaroCapabilities, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.getCapabilitiesLocked()
 }
 
 func NewGaroClient(baseURL string) *GaroClient {
@@ -75,34 +362,7 @@ func (g *GaroClient) GetLBConfig() (map[string]json.RawMessage, error) {
 	return g.getLBConfig()
 }
 
-func (g *GaroClient) setLoadBalancingCurrent(field string, currentA int) error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	switch field {
-	case "loadBalancingFuse", "loadBalancingFuse101":
-	default:
-		return fmt.Errorf("unsupported load-balancing current field %q", field)
-	}
-
-	// Always fetch the complete current GARO configuration first.
-	cfg, err := g.getLBConfig()
-	if err != nil {
-		return err
-	}
-
-	// Avoid even a no-op POST when the current GARO value already matches.
-	if existing := rawInt(cfg[field]); existing != nil && *existing == currentA {
-		return nil
-	}
-
-	// The GARO servlet updates Derby client-box rows whenever a slaves array is
-	// included in the POST. The charger accepts the same top-level load-balancing
-	// configuration without that array, avoiding persistent SD-card writes for
-	// ordinary DLM current adjustments.
-	delete(cfg, "slaves")
-	cfg[field] = json.RawMessage(strconv.Itoa(currentA))
-
+func (g *GaroClient) postLBConfig(cfg map[string]json.RawMessage) error {
 	payload, err := json.Marshal(cfg)
 	if err != nil {
 		return err
@@ -136,12 +396,60 @@ func (g *GaroClient) setLoadBalancingCurrent(field string, currentA int) error {
 	return nil
 }
 
+func (g *GaroClient) setLoadBalancingCurrent(
+	field string,
+	currentA int,
+	persistent bool,
+) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	switch field {
+	case "loadBalancingFuse", "loadBalancingFuse101":
+	default:
+		return fmt.Errorf("unsupported load-balancing current field %q", field)
+	}
+	if currentA <= 0 {
+		return fmt.Errorf("%s current must be positive, got %d A", field, currentA)
+	}
+
+	// Always fetch the complete current GARO configuration first. This also
+	// preserves fields added by GARO firmware versions that this client does not
+	// know about.
+	cfg, err := g.getLBConfig()
+	if err != nil {
+		return err
+	}
+
+	// Avoid a POST (and for CENTRAL101, an unnecessary Derby write) when GARO
+	// already has the requested setting.
+	if existing := rawInt(cfg[field]); existing != nil && *existing == currentA {
+		return nil
+	}
+
+	if !persistent {
+		// CENTRAL100 is the dynamic DLM actuator. GARO accepts top-level
+		// load-balancing updates without the slaves array; omitting it avoids
+		// persistent Derby client-box writes for every control adjustment.
+		delete(cfg, "slaves")
+	}
+	cfg[field] = json.RawMessage(strconv.Itoa(currentA))
+
+	return g.postLBConfig(cfg)
+}
+
 func (g *GaroClient) SetLoadBalancingFuse(currentA int) error {
-	return g.setLoadBalancingCurrent("loadBalancingFuse", currentA)
+	return g.setLoadBalancingCurrent("loadBalancingFuse", currentA, false)
 }
 
 func (g *GaroClient) SetLoadBalancingFuse101(currentA int) error {
-	return g.setLoadBalancingCurrent("loadBalancingFuse101", currentA)
+	// Do not round-trip GARO's live slaves array when changing CENTRAL101.
+	// Those objects contain persistent charger configuration (including
+	// loadBalanced and phase/rotation state), and writing them back can alter
+	// charger configuration. Until the vendor persistence request is fully
+	// understood, CENTRAL101 uses the same top-level-only safe write as
+	// CENTRAL100. This changes the live value without rewriting charger rows.
+	return g.setLoadBalancingCurrent("loadBalancingFuse101", currentA, false)
 }
 
 func (g *GaroClient) SetChargeMode(mode string) error {
@@ -248,8 +556,14 @@ func (g *GaroClient) GetMeterInfo(name string) (GaroMeterInfo, error) {
 }
 
 type GaroPilotLevel struct {
-	SerialNumber int `json:"serial_number"`
-	PilotA       int `json:"pilot_a"`
+	SerialNumber      int    `json:"serial_number"`
+	PilotA            int    `json:"pilot_a"`
+	MaxPilotA         int    `json:"max_pilot_a,omitempty"`
+	Connector         string `json:"connector,omitempty"`
+	Charging          bool   `json:"charging"`
+	Saturated         bool   `json:"saturated"`
+	LoadBalanced      bool   `json:"load_balanced"`
+	LoadBalancedKnown bool   `json:"load_balanced_known"`
 }
 
 type GaroFastInfo struct {
@@ -265,10 +579,23 @@ func (g *GaroClient) GetFastInfo() (GaroFastInfo, error) {
 		SerialNumber int    `json:"serialNumber"`
 		PilotLevel   int    `json:"pilotLevel"`
 		Mode         string `json:"mode"`
+		Connector    string `json:"connector"`
+		LoadBalanced *bool  `json:"loadBalanced"`
+	}
+	type pilotState struct {
+		PilotA            int
+		Connector         string
+		LoadBalanced      bool
+		LoadBalancedKnown bool
 	}
 
+	// Capability discovery is best-effort for telemetry. A transient GARO API
+	// failure leaves limits unknown and schedules a later retry; live polling
+	// still continues with the last-known capability values.
+	capabilities, _ := g.getCapabilitiesLocked()
+
 	var info GaroFastInfo
-	levels := make(map[int]int)
+	levels := make(map[int]pilotState)
 
 	resp, err := g.client.Get(g.baseURL + "/status")
 	if err != nil {
@@ -292,7 +619,15 @@ func (g *GaroClient) GetFastInfo() (GaroFastInfo, error) {
 	resp.Body.Close()
 
 	if master.SerialNumber != 0 {
-		levels[master.SerialNumber] = master.PilotLevel
+		state := pilotState{
+			PilotA:    master.PilotLevel,
+			Connector: master.Connector,
+		}
+		if master.LoadBalanced != nil {
+			state.LoadBalanced = *master.LoadBalanced
+			state.LoadBalancedKnown = true
+		}
+		levels[master.SerialNumber] = state
 	}
 	info.ChargeMode = master.Mode
 
@@ -318,15 +653,31 @@ func (g *GaroClient) GetFastInfo() (GaroFastInfo, error) {
 
 	for _, slave := range slaves {
 		if slave.SerialNumber != 0 {
-			levels[slave.SerialNumber] = slave.PilotLevel
+			state := pilotState{
+				PilotA:    slave.PilotLevel,
+				Connector: slave.Connector,
+			}
+			if slave.LoadBalanced != nil {
+				state.LoadBalanced = *slave.LoadBalanced
+				state.LoadBalancedKnown = true
+			}
+			levels[slave.SerialNumber] = state
 		}
 	}
 
 	info.PilotLevels = make([]GaroPilotLevel, 0, len(levels))
-	for serial, pilot := range levels {
+	for serial, state := range levels {
+		connector := strings.ToUpper(strings.TrimSpace(state.Connector))
+		maxPilotA := capabilities.MaxPilotA(serial)
 		info.PilotLevels = append(info.PilotLevels, GaroPilotLevel{
-			SerialNumber: serial,
-			PilotA:       pilot,
+			SerialNumber:      serial,
+			PilotA:            state.PilotA,
+			MaxPilotA:         maxPilotA,
+			Connector:         connector,
+			Charging:          connector == "CHARGING",
+			Saturated:         maxPilotA > 0 && state.PilotA >= maxPilotA,
+			LoadBalanced:      state.LoadBalanced,
+			LoadBalancedKnown: state.LoadBalancedKnown,
 		})
 	}
 
@@ -724,6 +1075,9 @@ func ensureLoadBalancingFuse101(
 		return nil
 	}
 
+	// CENTRAL101 is restored to the configured live limit using a top-level-only
+	// lbconfig write. Do not include GARO's live slaves array here: that array
+	// contains persistent charger configuration such as loadBalanced/phase data.
 	if err := garo.SetLoadBalancingFuse101(cfg.LoadBalancingFuse101A); err != nil {
 		return err
 	}

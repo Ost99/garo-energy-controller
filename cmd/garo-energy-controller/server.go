@@ -121,6 +121,19 @@ func appendWarning(response *SaveResponse, warning string) {
 	response.Warning += "; " + warning
 }
 
+func appendStatusError(existing, extra string) string {
+	if extra == "" {
+		return existing
+	}
+	if existing == "" {
+		return extra
+	}
+	if existing == extra {
+		return existing
+	}
+	return existing + "; " + extra
+}
+
 func writeJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(value)
@@ -154,9 +167,8 @@ func (s *HTTPServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	status.Error = garoErrorSummary(garoState)
-	if controllerStatus.Error != "" && status.Error == "" {
-		status.Error = controllerStatus.Error
-	}
+	status.Error = appendStatusError(status.Error, controllerStatus.Error)
+	status.Error = appendStatusError(status.Error, controllerStatus.ChargerLoadBalancingError)
 
 	writeJSON(w, status)
 }
@@ -242,9 +254,9 @@ func (s *HTTPServer) handleSafe(w http.ResponseWriter, r *http.Request) {
 	}
 	s.garoCache.NoteLoadBalancingFuse(cfg.SafeCurrentA)
 
-	// Record the operator action so automatic DLM control cannot overwrite the
-	// safe-current request on the very next tick. The controller holds for at
-	// least one normal dwell/control interval.
+	// Give the manual action one normal control dwell before automatic control
+	// may change DLM100 again. This prevents a safe-current press from being
+	// immediately overwritten by the next controller tick.
 	s.controller.NoteManualAction(cfg.SafeCurrentA - oldCurrent)
 
 	writeJSON(w, map[string]any{
@@ -277,7 +289,8 @@ func (s *HTTPServer) handleChargeMode(w http.ResponseWriter, r *http.Request) {
 	s.garoCache.NoteChargeMode(request.Mode)
 
 	// Charge-availability changes are deliberate operator actions. Hold DLM
-	// automation briefly so the next tick cannot race the GARO mode transition.
+	// automation for one normal dwell so the next tick cannot immediately race
+	// the GARO mode transition.
 	s.controller.NoteManualAction(0)
 
 	writeJSON(w, map[string]any{
