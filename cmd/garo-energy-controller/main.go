@@ -48,17 +48,15 @@ func main() {
 		cfg.HourlyLimitKWh,
 	)
 
-	if err := applyMode(cfg, garo); err != nil {
-		log.Printf("warning: could not apply startup mode: %v", err)
-	}
-
 	garoCache := NewGaroCache()
 	// Prime in-memory values before the controller starts. Browser status
 	// requests read this cache and never call the GARO API directly.
 	garoCache.RefreshFast(garo)
-	if err := ensureLoadBalancingFuse101(cfg, garo, garoCache); err != nil {
-		log.Printf("warning: could not apply configured CENTRAL101 limit: %v", err)
-	}
+
+	// The startup mode and CENTRAL101 are not written here: at boot this
+	// service starts minutes before GARO's SerialService is ready. The
+	// controller applies them on its first loop once GARO is ready
+	// (garo_settings.go).
 	go garoCache.RunFast(context.Background(), garo)
 
 	tibber := NewTibberClient(secrets.TibberToken)

@@ -196,6 +196,8 @@ type ControllerSnapshot struct {
 	Decision string `json:"decision,omitempty"`
 	LastRun  string `json:"last_run,omitempty"`
 	Error    string `json:"error,omitempty"`
+
+	GaroSettingsStatus string `json:"garo_settings_status,omitempty"`
 }
 
 type EnergyController struct {
@@ -223,6 +225,10 @@ type EnergyController struct {
 	fallbackEnergyKWh     float64
 	fallbackLast          time.Time
 	fallbackReferenceTime time.Time
+
+	// garoSettings applies the configured GARO settings (startup mode,
+	// CENTRAL101) once GARO is ready. See garo_settings.go.
+	garoSettings *garoSettingsSync
 }
 
 func NewEnergyController(
@@ -240,6 +246,7 @@ func NewEnergyController(
 		getConfig:    getConfig,
 		hardStopped:  hardStopped,
 		hardStopHour: hardStopHour,
+		garoSettings: newGaroSettingsSync(),
 	}
 }
 
@@ -253,10 +260,26 @@ func (c *EnergyController) Snapshot() ControllerSnapshot {
 }
 
 func (c *EnergyController) setSnapshot(s ControllerSnapshot) {
+	s.GaroSettingsStatus = c.garoSettings.Status()
+	s.Error = appendStatusError(s.Error, s.GaroSettingsStatus)
+
 	c.snapshotMu.Lock()
 	defer c.snapshotMu.Unlock()
 
 	c.snapshot = s
+}
+
+// SyncGaroSettings applies the configured GARO settings if GARO is ready.
+// Called by the control loop before every tick and after settings saves.
+func (c *EnergyController) SyncGaroSettings() error {
+	return c.garoSettings.Sync(time.Now(), c.getConfig(), c.garo, c.garoCache)
+}
+
+// GaroSettingsChanged marks the GARO settings for re-application after a
+// settings save and applies them immediately if GARO is ready.
+func (c *EnergyController) GaroSettingsChanged() error {
+	c.garoSettings.MarkPending()
+	return c.SyncGaroSettings()
 }
 
 func hourStart(t time.Time) time.Time {
@@ -416,6 +439,10 @@ func (c *EnergyController) getEnergySource(
 
 func (c *EnergyController) Run(ctx context.Context) {
 	for {
+		// Apply the startup mode and CENTRAL101 before the first control
+		// decision that follows GARO becoming ready. Errors are reported via
+		// the snapshot and retried by the sync itself.
+		_ = c.SyncGaroSettings()
 		c.tick()
 
 		cfg := c.getConfig()

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -356,6 +357,30 @@ func (g *GaroClient) getLBConfig() (map[string]json.RawMessage, error) {
 	return cfg, nil
 }
 
+// errGaroStarting reports SerialService's start-up state. While it waits for
+// the charge card (about 70 s after it starts listening), /lbconfig/false
+// answers with every value zeroed and slaves=null. Those values are not real
+// configuration and must never be used or written back.
+var errGaroStarting = errors.New(
+	"GARO is still starting (load-balancing configuration not loaded yet)",
+)
+
+// garoLBConfigStarting reports whether an lbconfig read is the start-up
+// placeholder rather than GARO's real configuration. On this firmware the
+// group-member list always contains at least the master charger once
+// SerialService is ready.
+func garoLBConfigStarting(cfg map[string]json.RawMessage) bool {
+	raw, ok := cfg["slaves"]
+	if !ok {
+		return true
+	}
+	var slaves []json.RawMessage
+	if err := json.Unmarshal(raw, &slaves); err != nil {
+		return true
+	}
+	return len(slaves) == 0
+}
+
 func (g *GaroClient) GetLBConfig() (map[string]json.RawMessage, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -419,6 +444,12 @@ func (g *GaroClient) setLoadBalancingCurrent(
 	cfg, err := g.getLBConfig()
 	if err != nil {
 		return err
+	}
+
+	// Never write back GARO's start-up placeholder: the POST would carry its
+	// zeroed values (including the other fuse field) into the live config.
+	if garoLBConfigStarting(cfg) {
+		return errGaroStarting
 	}
 
 	// Avoid a POST (and for CENTRAL101, an unnecessary Derby write) when GARO
@@ -935,6 +966,13 @@ func (c *GaroCache) RefreshLoadBalancing(g *GaroClient) bool {
 		return false
 	}
 
+	if garoLBConfigStarting(lbCfg) {
+		c.mu.Lock()
+		c.lbError = errGaroStarting.Error()
+		c.mu.Unlock()
+		return false
+	}
+
 	fuse100 := rawInt(lbCfg["loadBalancingFuse"])
 	fuse101 := rawInt(lbCfg["loadBalancingFuse101"])
 	if fuse100 == nil || fuse101 == nil {
@@ -1063,26 +1101,6 @@ func garoErrorSummary(s GaroCacheSnapshot) string {
 		parts = append(parts, "charge mode: "+s.ChargeModeError)
 	}
 	return strings.Join(parts, "; ")
-}
-
-func ensureLoadBalancingFuse101(
-	cfg Config,
-	garo *GaroClient,
-	garoCache *GaroCache,
-) error {
-	state := garoCache.Snapshot(time.Now())
-	if state.LBValid && state.LoadBalancingFuse101 == cfg.LoadBalancingFuse101A {
-		return nil
-	}
-
-	// CENTRAL101 is restored to the configured live limit using a top-level-only
-	// lbconfig write. Do not include GARO's live slaves array here: that array
-	// contains persistent charger configuration such as loadBalanced/phase data.
-	if err := garo.SetLoadBalancingFuse101(cfg.LoadBalancingFuse101A); err != nil {
-		return err
-	}
-	garoCache.NoteLoadBalancingFuse101(cfg.LoadBalancingFuse101A)
-	return nil
 }
 
 // applyMode applies the immediate current for startup and explicit mode changes.

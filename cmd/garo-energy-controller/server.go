@@ -201,12 +201,13 @@ func (s *HTTPServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 		response := SaveResponse{OK: true, Saved: saved}
 
-		// CENTRAL101 is a fixed charger-subfeed ceiling. The setter uses the
-		// tested no-slaves lbconfig payload, avoiding Derby slave-row writes.
-		if err := ensureLoadBalancingFuse101(newCfg, s.garo, s.garoCache); err != nil {
+		// CENTRAL101 is a fixed charger-subfeed ceiling owned by this config.
+		// It is compared first and only written on a difference; if GARO is
+		// not ready the controller applies it as soon as it is.
+		if err := s.controller.GaroSettingsChanged(); err != nil {
 			appendWarning(
 				&response,
-				"Configuration saved, but CENTRAL101 update failed: "+err.Error(),
+				"Configuration saved, but CENTRAL101 is not applied yet (retried automatically): "+err.Error(),
 			)
 		}
 
