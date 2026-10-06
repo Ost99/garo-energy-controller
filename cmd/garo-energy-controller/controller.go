@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -20,8 +21,14 @@ const (
 	// only move the ceiling without increasing charging.
 	largeUnusedDLMHeadroomA = 4.0
 
+	// hardStopLeadTime is the assumed time from ALWAYS_OFF until the cars'
+	// power draw has actually stopped (observed 120-180 s). A hard stop must
+	// be issued at least this long before the hourly limit would be reached.
 	hardStopLeadTime  = 180 * time.Second
 	hardStopStatePath = "/var/lib/garo-energy-controller/hard-stop"
+
+	// hardStopEndOfHourMargin: see hardStopRequired.
+	hardStopEndOfHourMargin = 30 * time.Second
 )
 
 func controlRefreshProblem(refresh GaroMeterRefreshResult, s GaroCacheSnapshot) string {
@@ -702,7 +709,26 @@ func hardStopRequired(s ControllerSnapshot) bool {
 	}
 
 	secondsToLimit := s.RemainingEnergyKWh / powerKW * 3600.0
-	return secondsToLimit <= hardStopLeadTime.Seconds()
+	if secondsToLimit > hardStopLeadTime.Seconds() {
+		return false
+	}
+
+	// The budget resets at the hour boundary, so a breach only matters if the
+	// limit would be reached before the hour ends. The margin covers error in
+	// Tibber's accumulated energy and power readings, not the stop latency
+	// (that is hardStopLeadTime).
+	return secondsToLimit <
+		float64(s.SecondsRemaining)+hardStopEndOfHourMargin.Seconds()
+}
+
+// hardStopSecondsToLimit is the projected time until the hourly limit at the
+// current grid power, for logging. It returns -1 when not meaningful.
+func hardStopSecondsToLimit(s ControllerSnapshot) float64 {
+	powerKW := math.Max(s.GridPowerW, 0) / 1000.0
+	if powerKW <= 0 {
+		return -1
+	}
+	return s.RemainingEnergyKWh / powerKW * 3600.0
 }
 
 func requiredUpDwell(
@@ -1069,6 +1095,15 @@ func (c *EnergyController) tick() {
 	// ALWAYS_OFF remains effective even when one charger is not participating
 	// in DLM, so evaluate this before suspending DLM regulation.
 	if hardStopRequired(s) {
+		log.Printf(
+			"hard stop: hour energy %.3f kWh, remaining %.3f kWh, grid %.0f W, "+
+				"limit in %.0f s, hour ends in %d s",
+			s.HourEnergyKWh,
+			s.RemainingEnergyKWh,
+			s.GridPowerW,
+			hardStopSecondsToLimit(s),
+			s.SecondsRemaining,
+		)
 		if err := c.activateHardStop(hourStart(referenceTime)); err != nil {
 			s.Error = err.Error()
 			s.Decision = "hard stop failed"
