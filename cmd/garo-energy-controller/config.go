@@ -29,6 +29,10 @@ type ControlTuningConfig struct {
 
 	PacingHorizonSeconds int     `json:"pacing_horizon_seconds"`
 	MaxPacingAdjustmentW float64 `json:"max_pacing_adjustment_w"`
+	// CatchUpFadeSeconds fades a positive pacing correction (catching up on
+	// energy not used earlier in the hour) linearly to zero over this many
+	// final seconds of the hour. 0 disables the fade.
+	CatchUpFadeSeconds int `json:"catch_up_fade_seconds"`
 
 	NormalDwellSeconds int `json:"normal_dwell_seconds"`
 	MidUpDwellSeconds  int `json:"mid_up_dwell_seconds"`
@@ -79,6 +83,7 @@ func defaultControlTuning() ControlTuningConfig {
 
 		PacingHorizonSeconds: 1800,
 		MaxPacingAdjustmentW: 2500,
+		CatchUpFadeSeconds:   3600,
 
 		NormalDwellSeconds: 60,
 		MidUpDwellSeconds:  90,
@@ -183,6 +188,9 @@ func (t ControlTuningConfig) Validate() error {
 	}
 	if t.PacingHorizonSeconds < 60 {
 		return fmt.Errorf("control_tuning.pacing_horizon_seconds must be at least 60")
+	}
+	if t.CatchUpFadeSeconds < 0 || t.CatchUpFadeSeconds > 3600 {
+		return fmt.Errorf("control_tuning.catch_up_fade_seconds must be 0..3600")
 	}
 	if t.MaxPacingAdjustmentW < 0 {
 		return fmt.Errorf("control_tuning.max_pacing_adjustment_w must be >= 0")

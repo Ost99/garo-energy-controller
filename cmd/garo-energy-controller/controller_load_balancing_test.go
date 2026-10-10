@@ -81,9 +81,9 @@ func TestHardStopRequiredWhenLimitBeforeHourEnd(t *testing.T) {
 	}
 }
 
-func TestHardStopEndOfHourMargin(t *testing.T) {
-	// Limit reached ~143 s from now, hour ends in 120 s: within the 30 s
-	// margin for measurement error, so stop.
+func TestHardStopNotRequiredWhenHourEndsUnderLimit(t *testing.T) {
+	// 0.4 kWh left at 10.1 kW with 120 s left: 0.337 kWh more this hour,
+	// ending ~63 Wh under the limit. Stopping only costs charging.
 	s := ControllerSnapshot{
 		Charging:           true,
 		EnergyValid:        true,
@@ -91,8 +91,37 @@ func TestHardStopEndOfHourMargin(t *testing.T) {
 		GridPowerW:         10100,
 		SecondsRemaining:   120,
 	}
+	if hardStopRequired(s) {
+		t.Fatal("hard stop issued although the hour is projected to end under the limit")
+	}
+}
+
+func TestHardStopNotRequiredWhenOnPaceAtEndOfHour(t *testing.T) {
+	// Observed 2026-10-09 23:58: on pace for 9.5 kWh, so remaining energy
+	// and the energy still to be drawn this hour are about equal.
+	s := ControllerSnapshot{
+		Charging:           true,
+		EnergyValid:        true,
+		RemainingEnergyKWh: 9.5 * 120 / 3600,
+		GridPowerW:         9400,
+		SecondsRemaining:   120,
+	}
+	if hardStopRequired(s) {
+		t.Fatal("hard stop issued for an hour paced exactly to the limit")
+	}
+}
+
+func TestHardStopRequiredWhenProjectedOverLimitAtEndOfHour(t *testing.T) {
+	// 0.25 kWh left at 10.1 kW with 120 s left: 0.337 kWh projected.
+	s := ControllerSnapshot{
+		Charging:           true,
+		EnergyValid:        true,
+		RemainingEnergyKWh: 0.25,
+		GridPowerW:         10100,
+		SecondsRemaining:   120,
+	}
 	if !hardStopRequired(s) {
-		t.Fatal("hard stop not issued within the end-of-hour margin")
+		t.Fatal("hard stop not issued although the hour is projected over the limit")
 	}
 }
 

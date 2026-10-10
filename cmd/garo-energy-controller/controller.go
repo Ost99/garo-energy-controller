@@ -27,8 +27,18 @@ const (
 	hardStopLeadTime  = 180 * time.Second
 	hardStopStatePath = "/var/lib/garo-energy-controller/hard-stop"
 
-	// hardStopEndOfHourMargin: see hardStopRequired.
-	hardStopEndOfHourMargin = 30 * time.Second
+	// hardStopOvershootToleranceKWh is how far the projected end-of-hour
+	// energy may exceed the hourly limit before a hard stop is issued. It is
+	// an energy margin, not a time margin: a time margin near the end of the
+	// hour fires even when the hour is projected to finish under the limit,
+	// because a correctly paced hour reaches the limit exactly at the
+	// boundary. The hourly limit itself is the safety margin.
+	hardStopOvershootToleranceKWh = 0.0
+
+	// noIncreaseFinalSeconds: no upward DLM changes this close to the end of
+	// the hour. Increases this late spend the slack faster than the slow
+	// downward path can correct, and only feed the hard stop.
+	noIncreaseFinalSeconds = 300
 )
 
 func controlRefreshProblem(refresh GaroMeterRefreshResult, s GaroCacheSnapshot) string {
@@ -713,12 +723,12 @@ func hardStopRequired(s ControllerSnapshot) bool {
 		return false
 	}
 
-	// The budget resets at the hour boundary, so a breach only matters if the
-	// limit would be reached before the hour ends. The margin covers error in
-	// Tibber's accumulated energy and power readings, not the stop latency
-	// (that is hardStopLeadTime).
-	return secondsToLimit <
-		float64(s.SecondsRemaining)+hardStopEndOfHourMargin.Seconds()
+	// The budget resets at the hour boundary, so a breach only matters if
+	// the energy projected for the rest of this hour at the current grid
+	// power exceeds what is left of the budget.
+	projectedOvershootKWh :=
+		powerKW*float64(s.SecondsRemaining)/3600.0 - s.RemainingEnergyKWh
+	return projectedOvershootKWh > hardStopOvershootToleranceKWh
 }
 
 // hardStopSecondsToLimit is the projected time until the hourly limit at the
@@ -848,6 +858,17 @@ func populateEnergyDiagnostics(
 		pacingCorrectionW = maxPacingAdjustmentW
 	} else if pacingCorrectionW < -maxPacingAdjustmentW {
 		pacingCorrectionW = -maxPacingAdjustmentW
+	}
+
+	// Catching up on unused energy late in the hour means ramping up after
+	// holding a steady state just below target, then needing to come down
+	// again before the boundary. Prefer ending the hour a little under the
+	// limit: fade positive corrections to zero over the final
+	// CatchUpFadeSeconds (default: the whole hour, i.e. scale by time left). Negative corrections (over pace) are never faded.
+	fadeSeconds := cfg.ControlTuning.CatchUpFadeSeconds
+	if pacingCorrectionW > 0 && fadeSeconds > 0 &&
+		secondsRemaining < fadeSeconds {
+		pacingCorrectionW *= float64(secondsRemaining) / float64(fadeSeconds)
 	}
 
 	pacingTargetPowerW := baseTargetPowerW + pacingCorrectionW
@@ -1290,6 +1311,13 @@ func (c *EnergyController) tick() {
 		pilotsSaturated, saturationSummary := activePilotsSaturated(s)
 
 		switch {
+		case s.SecondsRemaining < noIncreaseFinalSeconds:
+			s.Decision = fmt.Sprintf(
+				"hold increase: %ds left of the hour (no increases in the final %ds)",
+				s.SecondsRemaining,
+				noIncreaseFinalSeconds,
+			)
+
 		case headroomW < upGateW:
 			s.Decision = fmt.Sprintf(
 				"within upward band: %.0f W headroom (%s gate %.0f W)",
