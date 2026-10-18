@@ -322,21 +322,6 @@ const settingsPage = `<!doctype html>
         <div class="panel-title">Control tuning</div>
         <div class="panel-body">
             <div class="config-grid">
-                <label for="controlStrategy">Control strategy</label>
-                <select id="controlStrategy">
-                    <option value="incremental">Incremental (default)</option>
-                    <option value="model">Model-based PI (under test)</option>
-                </select>
-
-                <label for="modelReserveFraction">Model: GARO reserve fraction</label>
-                <div><input id="modelReserveFraction" type="number" min="0" max="0.3" step="0.01"></div>
-
-                <label for="modelKp">Model: proportional gain</label>
-                <div><input id="modelKp" type="number" min="0" max="2" step="0.05"></div>
-
-                <label for="modelIntegralSeconds">Model: integral time</label>
-                <div><input id="modelIntegralSeconds" type="number" min="30" step="30"> s</div>
-
                 <label for="downDeadband">Downward deadband</label>
                 <div><input id="downDeadband" type="number" min="0" step="50"> W</div>
 
@@ -449,10 +434,6 @@ async function loadConfiguration() {
         const t = c.control_tuning || {};
         document.getElementById("downDeadband").value = t.down_deadband_w;
         document.getElementById("urgentDown").value = t.urgent_down_w;
-        document.getElementById("controlStrategy").value = t.control_strategy;
-        document.getElementById("modelReserveFraction").value = t.model_reserve_fraction;
-        document.getElementById("modelKp").value = t.model_kp;
-        document.getElementById("modelIntegralSeconds").value = t.model_integral_seconds;
         document.getElementById("onePhaseGate").value = t.one_phase_up_gate_w;
         document.getElementById("onePhaseTwoAmp").value = t.one_phase_two_amp_threshold_w;
         document.getElementById("onePhaseCalculated").value = t.one_phase_calculated_threshold_w;
@@ -495,10 +476,6 @@ async function saveConfig() {
         control_tuning: {
             down_deadband_w: Number(document.getElementById("downDeadband").value),
             urgent_down_w: Number(document.getElementById("urgentDown").value),
-            control_strategy: document.getElementById("controlStrategy").value,
-            model_reserve_fraction: Number(document.getElementById("modelReserveFraction").value),
-            model_kp: Number(document.getElementById("modelKp").value),
-            model_integral_seconds: Number(document.getElementById("modelIntegralSeconds").value),
             one_phase_up_gate_w: Number(document.getElementById("onePhaseGate").value),
             one_phase_two_amp_threshold_w: Number(document.getElementById("onePhaseTwoAmp").value),
             one_phase_calculated_threshold_w: Number(document.getElementById("onePhaseCalculated").value),
