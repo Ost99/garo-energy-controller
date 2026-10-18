@@ -39,17 +39,6 @@ type ControlTuningConfig struct {
 	NearUpDwellSeconds int `json:"near_up_dwell_seconds"`
 
 	UnusedDLMHeadroomA float64 `json:"unused_dlm_headroom_a"`
-
-	// ControlStrategy selects DLM regulation: "model" (model-based PI, see
-	// controller_model.go) or "incremental" (the original step controller).
-	ControlStrategy string `json:"control_strategy"`
-
-	ModelAverageSeconds  int     `json:"model_average_seconds"`
-	ModelReserveFraction float64 `json:"model_reserve_fraction"`
-	ModelKp              float64 `json:"model_kp"`
-	ModelIntegralSeconds int     `json:"model_integral_seconds"`
-	ModelIntegralLimitA  float64 `json:"model_integral_limit_a"`
-	ModelHysteresisA     float64 `json:"model_hysteresis_a"`
 }
 
 type Config struct {
@@ -101,14 +90,6 @@ func defaultControlTuning() ControlTuningConfig {
 		NearUpDwellSeconds: 120,
 
 		UnusedDLMHeadroomA: 1.0,
-
-		ControlStrategy:      "model",
-		ModelAverageSeconds:  180,
-		ModelReserveFraction: 0.11,
-		ModelKp:              0.5,
-		ModelIntegralSeconds: 300,
-		ModelIntegralLimitA:  6,
-		ModelHysteresisA:     1.0,
 	}
 }
 
@@ -219,27 +200,6 @@ func (t ControlTuningConfig) Validate() error {
 	}
 	if t.UnusedDLMHeadroomA < 0 {
 		return fmt.Errorf("control_tuning.unused_dlm_headroom_a must be >= 0")
-	}
-	if t.ControlStrategy != "model" && t.ControlStrategy != "incremental" {
-		return fmt.Errorf("control_tuning.control_strategy must be \"model\" or \"incremental\"")
-	}
-	if t.ModelAverageSeconds < 30 || t.ModelAverageSeconds > 900 {
-		return fmt.Errorf("control_tuning.model_average_seconds must be 30..900")
-	}
-	if t.ModelReserveFraction < 0 || t.ModelReserveFraction > 0.3 {
-		return fmt.Errorf("control_tuning.model_reserve_fraction must be 0..0.3")
-	}
-	if t.ModelKp < 0 || t.ModelKp > 2 {
-		return fmt.Errorf("control_tuning.model_kp must be 0..2")
-	}
-	if t.ModelIntegralSeconds < 30 {
-		return fmt.Errorf("control_tuning.model_integral_seconds must be at least 30")
-	}
-	if t.ModelIntegralLimitA < 0 || t.ModelIntegralLimitA > 20 {
-		return fmt.Errorf("control_tuning.model_integral_limit_a must be 0..20")
-	}
-	if t.ModelHysteresisA < 1 || t.ModelHysteresisA > 3 {
-		return fmt.Errorf("control_tuning.model_hysteresis_a must be 1..3")
 	}
 
 	return nil

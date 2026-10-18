@@ -192,15 +192,6 @@ type ControllerSnapshot struct {
 	CalculatedRequiredIncreaseA float64 `json:"calculated_required_increase_a,omitempty"`
 	CalculatedDLMTargetA        int     `json:"calculated_dlm_target_a,omitempty"`
 
-	ModelGridAvgW           float64 `json:"model_grid_avg_w,omitempty"`
-	ModelHouseholdAvgW      float64 `json:"model_household_avg_w,omitempty"`
-	ModelWorstHouseholdAvgA float64 `json:"model_worst_household_avg_a,omitempty"`
-	ModelFeedForwardA       float64 `json:"model_feed_forward_a,omitempty"`
-	ModelProportionalA      float64 `json:"model_proportional_a,omitempty"`
-	ModelIntegralA          float64 `json:"model_integral_a,omitempty"`
-	ModelCarSetpointA       float64 `json:"model_car_setpoint_a,omitempty"`
-	ModelDesiredDLMA        float64 `json:"model_desired_dlm_a,omitempty"`
-
 	Central100Phase1A    float64 `json:"central100_phase1_a"`
 	Central100Phase2A    float64 `json:"central100_phase2_a"`
 	Central100Phase3A    float64 `json:"central100_phase3_a"`
@@ -251,9 +242,6 @@ type EnergyController struct {
 	fallbackEnergyKWh     float64
 	fallbackLast          time.Time
 	fallbackReferenceTime time.Time
-
-	// model is the state of the model-based DLM controller.
-	model dlmModel
 
 	// garoSettings applies the configured GARO settings (startup mode,
 	// CENTRAL101) once GARO is ready. See garo_settings.go.
@@ -934,7 +922,6 @@ func clearEnergyDiagnostics(s *ControllerSnapshot) {
 	s.ReferenceTime = ""
 	s.CalculatedRequiredIncreaseA = 0
 	s.CalculatedDLMTargetA = 0
-	clearModelDiagnostics(s)
 }
 
 func (c *EnergyController) tick() {
@@ -951,7 +938,6 @@ func (c *EnergyController) tick() {
 	s.Error = ""
 	s.CalculatedRequiredIncreaseA = 0
 	s.CalculatedDLMTargetA = 0
-	clearModelDiagnostics(&s)
 
 	age := c.adjustmentAge(now)
 	if age < 365*24*time.Hour {
@@ -1139,7 +1125,6 @@ func (c *EnergyController) tick() {
 			hardStopSecondsToLimit(s),
 			s.SecondsRemaining,
 		)
-		c.model.reset()
 		if err := c.activateHardStop(hourStart(referenceTime)); err != nil {
 			s.Error = err.Error()
 			s.Decision = "hard stop failed"
@@ -1174,7 +1159,6 @@ func (c *EnergyController) tick() {
 	// Session idle handling.
 	if !s.Charging {
 		s.State = "idle"
-		c.model.reset()
 
 		if c.idleSince.IsZero() {
 			c.idleSince = now
@@ -1228,7 +1212,6 @@ func (c *EnergyController) tick() {
 	c.garoCache.SetDeepIdle(false)
 
 	if !valid {
-		c.model.reset()
 		s.State = "fallback-safe"
 		s.Decision =
 			"no trustworthy hourly energy value; using safe current"
@@ -1272,9 +1255,7 @@ func (c *EnergyController) tick() {
 	// Defensive fallback: when charging is active, hardStopRequired() above
 	// handles an exhausted hourly budget by disabling charging. Keep the
 	// minimum-current path for any edge case that reaches this point.
-	if remainingEnergy > 0 && cfg.ControlTuning.ControlStrategy == "model" {
-		target = c.modelDecision(&s, cfg, now, gridPower, currentLimit, adjustmentAge)
-	} else if remainingEnergy <= 0 {
+	if remainingEnergy <= 0 {
 		target = cfg.MinimumCurrentA
 		s.Decision = "hourly budget exhausted"
 
@@ -1481,7 +1462,6 @@ func (c *EnergyController) tick() {
 	}
 
 	c.noteAdjustment(now, target-currentLimit)
-	log.Printf("DLM %d -> %d A: %s", currentLimit, target, s.Decision)
 
 	s.DLMCurrentA = target
 	s.DLMHeadroomA =
@@ -1495,90 +1475,4 @@ func (c *EnergyController) tick() {
 	)
 
 	c.setSnapshot(s)
-}
-
-func clearModelDiagnostics(s *ControllerSnapshot) {
-	s.ModelGridAvgW = 0
-	s.ModelHouseholdAvgW = 0
-	s.ModelWorstHouseholdAvgA = 0
-	s.ModelFeedForwardA = 0
-	s.ModelProportionalA = 0
-	s.ModelIntegralA = 0
-	s.ModelCarSetpointA = 0
-	s.ModelDesiredDLMA = 0
-}
-
-// modelDecision runs one step of the model-based controller and returns the
-// DLM target for this tick (currentLimit when holding).
-func (c *EnergyController) modelDecision(
-	s *ControllerSnapshot,
-	cfg Config,
-	now time.Time,
-	gridPower float64,
-	currentLimit int,
-	adjustmentAge time.Duration,
-) int {
-	pilotsSaturated, saturationSummary := activePilotsSaturated(*s)
-	finalWindow := s.SecondsRemaining < noIncreaseFinalSeconds
-
-	out := c.model.step(modelInput{
-		Now:   now,
-		GridW: gridPower,
-		SitePhaseA: [3]float64{
-			s.Central100Phase1A, s.Central100Phase2A, s.Central100Phase3A,
-		},
-		CarPhaseA: [3]float64{
-			s.Central101Phase1A, s.Central101Phase2A, s.Central101Phase3A,
-		},
-		TargetW:     s.EffectiveTargetPowerW,
-		CurrentDLMA: currentLimit,
-		OnePhase:    s.PhaseMode == "one-phase",
-		CanIncrease: !finalWindow && !pilotsSaturated,
-		MinA:        cfg.MinimumCurrentA,
-		MaxA:        cfg.MaximumCurrentA,
-	}, cfg.ControlTuning)
-
-	s.ModelGridAvgW = out.GridAvgW
-	s.ModelHouseholdAvgW = out.HouseholdAvgW
-	s.ModelWorstHouseholdAvgA = out.WorstHouseholdAvgA
-	s.ModelFeedForwardA = out.FeedForwardA
-	s.ModelProportionalA = out.ProportionalA
-	s.ModelIntegralA = out.IntegralA
-	s.ModelCarSetpointA = out.CarSetpointA
-	s.ModelDesiredDLMA = out.DesiredDLMA
-
-	summary := fmt.Sprintf(
-		"car setpoint %.1f A (ff %.1f, p %.1f, i %.1f), avg grid %.0f W, "+
-			"worst-phase household %.1f A -> DLM %.1f A",
-		out.CarSetpointA, out.FeedForwardA, out.ProportionalA, out.IntegralA,
-		out.GridAvgW, out.WorstHouseholdAvgA, out.DesiredDLMA,
-	)
-
-	normalDwell := time.Duration(cfg.ControlTuning.NormalDwellSeconds) * time.Second
-
-	switch {
-	case out.TargetDLMA == currentLimit:
-		reason := "within hysteresis"
-		if out.DesiredDLMA > float64(currentLimit) && finalWindow {
-			reason = fmt.Sprintf("no increases in the final %ds", noIncreaseFinalSeconds)
-		} else if out.DesiredDLMA > float64(currentLimit) && pilotsSaturated {
-			reason = "active GARO pilots saturated (" + saturationSummary + ")"
-		}
-		s.Decision = "model hold: " + reason + "; " + summary
-		return currentLimit
-
-	case adjustmentAge < normalDwell:
-		s.Decision = fmt.Sprintf(
-			"model hold %d A: waiting for previous DLM change (%ds/%ds); %s",
-			out.TargetDLMA,
-			int(adjustmentAge.Seconds()),
-			int(normalDwell.Seconds()),
-			summary,
-		)
-		return currentLimit
-
-	default:
-		s.Decision = "model: " + summary
-		return out.TargetDLMA
-	}
 }
