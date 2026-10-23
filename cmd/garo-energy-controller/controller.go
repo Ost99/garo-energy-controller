@@ -170,6 +170,11 @@ type ControllerSnapshot struct {
 	ExpectedHourEnergyKWh float64 `json:"expected_hour_energy_kwh"`
 	EnergyPacingErrorKWh  float64 `json:"energy_pacing_error_kwh"`
 
+	// RemainingTargetEnergyKWh is the energy left to the regulation target
+	// (limit minus margin). RemainingEnergyKWh, to the absolute limit, is
+	// used only by the hard stop.
+	RemainingTargetEnergyKWh float64 `json:"remaining_target_energy_kwh"`
+
 	GridPowerW            float64 `json:"grid_power_w"`
 	BaseTargetPowerW      float64 `json:"base_target_power_w"`
 	PacingCorrectionW     float64 `json:"pacing_correction_w"`
@@ -835,12 +840,21 @@ func populateEnergyDiagnostics(
 
 	s.SecondsRemaining = secondsRemaining
 
-	// The hourly limit is both a nominal power target and a hard energy
-	// ceiling. Pace toward the nominal target over a fixed recovery horizon
-	// instead of trying to spend every unused Wh before the top of the hour.
-	// This prevents the target from accelerating sharply as secondsRemaining
-	// approaches zero.
-	baseTargetPowerW := cfg.HourlyLimitKWh * 1000.0
+	// The hourly limit is an absolute ceiling enforced by the hard stop
+	// (RemainingEnergyKWh). Regulation paces toward a target a configurable
+	// margin below it, so normal regulation error late in the hour does not
+	// reach the limit. Pace over a fixed recovery horizon instead of trying
+	// to spend every unused Wh before the top of the hour. This prevents the
+	// target from accelerating sharply as secondsRemaining approaches zero.
+	targetKWh := cfg.HourlyLimitKWh - cfg.TargetMarginWh/1000.0
+	remainingToTargetKWh := targetKWh - hourEnergy
+	if remainingToTargetKWh < 0 {
+		remainingToTargetKWh = 0
+	}
+
+	s.RemainingTargetEnergyKWh = remainingToTargetKWh
+
+	baseTargetPowerW := targetKWh * 1000.0
 	elapsedSeconds := 3600 - secondsRemaining
 	if elapsedSeconds < 0 {
 		elapsedSeconds = 0
@@ -850,7 +864,7 @@ func populateEnergyDiagnostics(
 	}
 
 	expectedHourEnergyKWh :=
-		cfg.HourlyLimitKWh * float64(elapsedSeconds) / 3600.0
+		targetKWh * float64(elapsedSeconds) / 3600.0
 	energyPacingErrorKWh := expectedHourEnergyKWh - hourEnergy
 
 	pacingCorrectionW :=
@@ -880,7 +894,7 @@ func populateEnergyDiagnostics(
 	}
 
 	hardBudgetCeilingW :=
-		remainingEnergy * 3600000.0 /
+		remainingToTargetKWh * 3600000.0 /
 			float64(secondsRemaining)
 
 	effectiveTargetPowerW := math.Min(
@@ -911,6 +925,7 @@ func clearEnergyDiagnostics(s *ControllerSnapshot) {
 	s.EnergyValid = false
 	s.HourEnergyKWh = 0
 	s.RemainingEnergyKWh = 0
+	s.RemainingTargetEnergyKWh = 0
 	s.ExpectedHourEnergyKWh = 0
 	s.EnergyPacingErrorKWh = 0
 	s.GridPowerW = 0
@@ -1249,7 +1264,7 @@ func (c *EnergyController) tick() {
 		return
 	}
 
-	remainingEnergy := s.RemainingEnergyKWh
+	remainingEnergy := s.RemainingTargetEnergyKWh
 	allowedPower := s.AllowedAveragePowerW
 	headroomW := s.PowerHeadroomW
 	maxSiteCurrentA := central100.MaxCurrentA()
@@ -1258,14 +1273,14 @@ func (c *EnergyController) tick() {
 	target := currentLimit
 	step := 0
 
-	// Defensive fallback: when charging is active, hardStopRequired() above
-	// handles an exhausted hourly budget by disabling charging. Keep the
-	// minimum-current path for any edge case that reaches this point.
+	// Regulation uses the target, not the absolute limit. Once the target is
+	// reached, hold the minimum current for the rest of the hour; an
+	// exhausted absolute limit is handled by hardStopRequired() above.
 	if remainingEnergy > 0 && cfg.ControlTuning.ControlStrategy == "model" {
 		target = c.modelDecision(&s, cfg, now, gridPower, currentLimit, adjustmentAge)
 	} else if remainingEnergy <= 0 {
 		target = cfg.MinimumCurrentA
-		s.Decision = "hourly budget exhausted"
+		s.Decision = "hourly target reached"
 
 	} else if headroomW < -cfg.ControlTuning.DownDeadbandW {
 		normalDwell := time.Duration(cfg.ControlTuning.NormalDwellSeconds) * time.Second

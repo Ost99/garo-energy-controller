@@ -55,6 +55,10 @@ type Config struct {
 	Mode    string `json:"mode"`
 
 	HourlyLimitKWh float64 `json:"hourly_limit_kwh"`
+	// TargetMarginWh is how far below HourlyLimitKWh regulation aims. The
+	// hourly limit itself is absolute and enforced by the hard stop; the
+	// margin absorbs normal regulation error so on-pace hours do not reach it.
+	TargetMarginWh float64 `json:"target_margin_wh"`
 
 	SafeCurrentA          int `json:"safe_current_a"`
 	MinimumCurrentA       int `json:"minimum_current_a"`
@@ -113,6 +117,7 @@ func defaultConfig() Config {
 		Mode:    "safe",
 
 		HourlyLimitKWh: 9.5,
+		TargetMarginWh: 75,
 
 		SafeCurrentA:          8,
 		MinimumCurrentA:       6,
@@ -137,6 +142,12 @@ func (c Config) Validate() error {
 
 	if c.HourlyLimitKWh <= 0 {
 		return fmt.Errorf("hourly_limit_kwh must be greater than 0")
+	}
+	if c.TargetMarginWh < 0 || c.TargetMarginWh > 1000 {
+		return fmt.Errorf("target_margin_wh must be 0..1000")
+	}
+	if c.TargetMarginWh >= c.HourlyLimitKWh*1000.0 {
+		return fmt.Errorf("target_margin_wh must be below hourly_limit_kwh")
 	}
 	if c.MinimumCurrentA < 6 {
 		return fmt.Errorf("minimum_current_a must be at least 6")

@@ -123,15 +123,19 @@ func TestModelCyclingSinglePhaseLoad(t *testing.T) {
 		}
 		return [3]float64{3.1, l2, 1.6}
 	}
+	// Regulation is measured against the target, not the absolute limit;
+	// the limit belongs to the hard stop, which this simulation excludes.
+	cfg := defaultConfig()
+	targetKWh := cfg.HourlyLimitKWh - cfg.TargetMarginWh/1000.0
 	for _, v := range plantVariants {
 		r := simulateModelHour(t, v.reserve, v.pilotStepS, cycling)
 		t.Logf("reserve %.2f, pilot step %.0f s: %.2f kWh, %d DLM writes, DLM %d..%d A",
 			v.reserve, v.pilotStepS, r.hourEnergyKWh, r.dlmWrites, r.minDLM, r.maxDLM)
-		if r.hourEnergyKWh > 9.5 {
-			t.Errorf("reserve %.2f, step %.0f s: %.3f kWh over the 9.5 kWh limit",
-				v.reserve, v.pilotStepS, r.hourEnergyKWh)
+		if r.hourEnergyKWh > targetKWh {
+			t.Errorf("reserve %.2f, step %.0f s: %.3f kWh over the %.3f kWh target",
+				v.reserve, v.pilotStepS, r.hourEnergyKWh, targetKWh)
 		}
-		if r.hourEnergyKWh < 8.9 {
+		if r.hourEnergyKWh < targetKWh-0.6 {
 			t.Errorf("reserve %.2f, step %.0f s: %.3f kWh leaves too much budget unused",
 				v.reserve, v.pilotStepS, r.hourEnergyKWh)
 		}
@@ -144,13 +148,15 @@ func TestModelCyclingSinglePhaseLoad(t *testing.T) {
 
 func TestModelSteadyHouseholdRampUp(t *testing.T) {
 	steady := func(float64) [3]float64 { return [3]float64{3, 2, 2} }
+	cfg := defaultConfig()
+	targetKWh := cfg.HourlyLimitKWh - cfg.TargetMarginWh/1000.0
 	for _, v := range plantVariants {
 		r := simulateModelHour(t, v.reserve, v.pilotStepS, steady)
 		t.Logf("reserve %.2f, pilot step %.0f s: %.2f kWh, %d DLM writes, car %.1f A after 5 min",
 			v.reserve, v.pilotStepS, r.hourEnergyKWh, r.dlmWrites, r.carAt5MinA)
-		if r.hourEnergyKWh > 9.5 || r.hourEnergyKWh < 9.2 {
-			t.Errorf("reserve %.2f, step %.0f s: %.3f kWh, want 9.2..9.5",
-				v.reserve, v.pilotStepS, r.hourEnergyKWh)
+		if r.hourEnergyKWh > targetKWh || r.hourEnergyKWh < targetKWh-0.3 {
+			t.Errorf("reserve %.2f, step %.0f s: %.3f kWh, want %.3f..%.3f",
+				v.reserve, v.pilotStepS, r.hourEnergyKWh, targetKWh-0.3, targetKWh)
 		}
 		// Target ~9.5 kW with ~1.7 kW household: ~10.8 A car.
 		if r.carAt5MinA < 9.5 {

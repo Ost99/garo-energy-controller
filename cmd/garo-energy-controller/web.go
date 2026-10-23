@@ -188,7 +188,7 @@ async function refreshStatus() {
         setText("hourEnergy", c.energy_valid ? c.hour_energy_kwh.toFixed(3) + " kWh" : "-");
         setText("expectedHourEnergy", c.energy_valid ? c.expected_hour_energy_kwh.toFixed(3) + " kWh" : "-");
         setText("pacingError", c.energy_valid ? (c.energy_pacing_error_kwh >= 0 ? "+" : "") + c.energy_pacing_error_kwh.toFixed(3) + " kWh" : "-");
-        setText("remainingEnergy", c.energy_valid ? c.remaining_energy_kwh.toFixed(3) + " kWh" : "-");
+        setText("remainingEnergy", c.energy_valid ? c.remaining_target_energy_kwh.toFixed(3) + " kWh" : "-");
         setText("baseTargetPower", c.energy_valid ? Math.round(c.base_target_power_w) + " W" : "-");
         setText("pacingCorrection", c.energy_valid ? (c.pacing_correction_w >= 0 ? "+" : "") + Math.round(c.pacing_correction_w) + " W" : "-");
         setText("pacingTarget", c.energy_valid ? Math.round(c.pacing_target_power_w) + " W" : "-");
@@ -278,6 +278,9 @@ const settingsPage = `<!doctype html>
 
                 <label for="hourlyLimit">Hourly grid limit</label>
                 <div><input id="hourlyLimit" type="number" min="0.1" step="0.01"> kWh</div>
+
+                <label for="targetMargin">Regulation target below limit</label>
+                <div><input id="targetMargin" type="number" min="0" max="1000" step="5"> Wh</div>
 
                 <label for="safeCurrent">Safe/default CENTRAL100 current</label>
                 <div><input id="safeCurrent" type="number" min="6" step="1"> A</div>
@@ -436,6 +439,7 @@ async function loadConfiguration() {
         document.getElementById("enabled").checked = c.enabled;
         document.getElementById("mode").value = c.mode;
         document.getElementById("hourlyLimit").value = c.hourly_limit_kwh;
+        document.getElementById("targetMargin").value = c.target_margin_wh;
         document.getElementById("safeCurrent").value = c.safe_current_a;
         document.getElementById("minimumCurrent").value = c.minimum_current_a;
         document.getElementById("maximumCurrent").value = c.maximum_current_a;
@@ -483,6 +487,7 @@ async function saveConfig() {
         enabled: document.getElementById("enabled").checked,
         mode: document.getElementById("mode").value,
         hourly_limit_kwh: Number(document.getElementById("hourlyLimit").value),
+        target_margin_wh: Number(document.getElementById("targetMargin").value),
         safe_current_a: Number(document.getElementById("safeCurrent").value),
         minimum_current_a: Number(document.getElementById("minimumCurrent").value),
         maximum_current_a: Number(document.getElementById("maximumCurrent").value),

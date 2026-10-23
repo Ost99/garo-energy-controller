@@ -54,9 +54,11 @@ func TestOverPaceCorrectionNotFaded(t *testing.T) {
 	cfg := defaultConfig()
 	var s ControllerSnapshot
 	ref := time.Date(2026, 10, 9, 23, 55, 0, 0, time.Local)
-	// 55 min in, expected 8.708 kWh; 9.0 kWh used is over pace.
+	// 55 min in, expected 8.640 kWh (paced to the 9.425 kWh target);
+	// 9.0 kWh used is over pace.
 	populateEnergyDiagnostics(&s, cfg, "test", 9.0, 9500, ref, true)
-	want := (cfg.HourlyLimitKWh*3300/3600 - 9.0) * 3600000.0 /
+	targetKWh := cfg.HourlyLimitKWh - cfg.TargetMarginWh/1000.0
+	want := (targetKWh*3300/3600 - 9.0) * 3600000.0 /
 		float64(cfg.ControlTuning.PacingHorizonSeconds)
 	if s.PacingCorrectionW > want+1 || s.PacingCorrectionW < want-1 {
 		t.Fatalf("over-pace correction %.0f W, want %.0f W", s.PacingCorrectionW, want)

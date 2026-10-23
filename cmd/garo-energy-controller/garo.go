@@ -184,15 +184,6 @@ func addGaroChargerCapability(
 	}
 }
 
-func rawIntByNames(values map[string]json.RawMessage, names ...string) int {
-	for _, name := range names {
-		if value := rawInt(values[name]); value != nil && *value > 0 {
-			return *value
-		}
-	}
-	return 0
-}
-
 func (g *GaroClient) getJSONBody(path string) ([]byte, error) {
 	resp, err := g.client.Get(g.baseURL + path)
 	if err != nil {
@@ -719,19 +710,6 @@ func (g *GaroClient) GetFastInfo() (GaroFastInfo, error) {
 	return info, nil
 }
 
-func (g *GaroClient) GetLoadBalancingFuse() (int, error) {
-	cfg, err := g.GetLBConfig()
-	if err != nil {
-		return 0, err
-	}
-
-	value := rawInt(cfg["loadBalancingFuse"])
-	if value == nil {
-		return 0, fmt.Errorf("loadBalancingFuse missing from GARO configuration")
-	}
-	return *value, nil
-}
-
 type GaroCache struct {
 	mu sync.RWMutex
 
@@ -1056,17 +1034,6 @@ func (c *GaroCache) NoteLoadBalancingFuse(currentA int) {
 	defer c.mu.Unlock()
 
 	c.loadBalancingFuse = currentA
-	if c.lbValid {
-		c.lbAt = time.Now()
-		c.lbError = ""
-	}
-}
-
-func (c *GaroCache) NoteLoadBalancingFuse101(currentA int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.loadBalancingFuse101 = currentA
 	if c.lbValid {
 		c.lbAt = time.Now()
 		c.lbError = ""
