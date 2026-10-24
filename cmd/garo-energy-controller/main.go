@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"log"
 	"net/http"
@@ -20,7 +21,29 @@ func main() {
 		"/etc/garo-energy-controller/secrets.json",
 		"secrets file",
 	)
+	tlsCertPath := flag.String(
+		"tls-cert",
+		"",
+		"TLS certificate chain (PEM); serves HTTPS when set together with -tls-key",
+	)
+	tlsKeyPath := flag.String(
+		"tls-key",
+		"",
+		"TLS private key (PEM)",
+	)
 	flag.Parse()
+
+	var certs *certReloader
+	if (*tlsCertPath == "") != (*tlsKeyPath == "") {
+		log.Fatalf("-tls-cert and -tls-key must be set together")
+	}
+	if *tlsCertPath != "" {
+		var err error
+		certs, err = newCertReloader(*tlsCertPath, *tlsKeyPath)
+		if err != nil {
+			log.Fatalf("TLS certificate error: %v", err)
+		}
+	}
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
@@ -72,8 +95,17 @@ func main() {
 
 	handler := NewHTTPHandler(store, garo, garoCache, tibber, controller)
 
-	log.Printf("GARO Energy Controller starting on %s", listenAddress)
-	if err := http.ListenAndServe(listenAddress, handler); err != nil {
-		log.Fatal(err)
+	if certs == nil {
+		log.Printf("GARO Energy Controller starting on %s (HTTP)", listenAddress)
+		err = http.ListenAndServe(listenAddress, handler)
+	} else {
+		log.Printf("GARO Energy Controller starting on %s (HTTPS)", listenAddress)
+		server := &http.Server{
+			Addr:      listenAddress,
+			Handler:   handler,
+			TLSConfig: &tls.Config{GetCertificate: certs.GetCertificate},
+		}
+		err = server.ListenAndServeTLS("", "")
 	}
+	log.Fatal(err)
 }

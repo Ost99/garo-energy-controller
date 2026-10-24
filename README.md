@@ -54,6 +54,18 @@ Example:
 
 The web interface is available on port `8090`.
 
+### HTTPS
+
+Pass a PEM certificate chain and private key to serve HTTPS on the same port:
+
+```bash
+./garo-energy-controller \
+  -tls-cert /etc/garo-energy-controller/tls/fullchain.pem \
+  -tls-key  /etc/garo-energy-controller/tls/privkey.pem
+```
+
+Certificate renewal is picked up automatically on the next connection; no restart is needed. Without these flags the server uses plain HTTP.
+
 
 ## TODO
 * Stop charging if target is likely to be overshot
