@@ -41,7 +41,9 @@ func main() {
 		var err error
 		certs, err = newCertReloader(*tlsCertPath, *tlsKeyPath)
 		if err != nil {
-			log.Fatalf("TLS certificate error: %v", err)
+			// Energy control must not depend on the web UI's certificate.
+			log.Printf("warning: TLS certificate error, falling back to HTTP: %v", err)
+			certs = nil
 		}
 	}
 

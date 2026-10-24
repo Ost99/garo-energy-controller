@@ -64,7 +64,7 @@ Pass a PEM certificate chain and private key to serve HTTPS on the same port:
   -tls-key  /etc/garo-energy-controller/tls/privkey.pem
 ```
 
-Certificate renewal is picked up automatically on the next connection; no restart is needed. Without these flags the server uses plain HTTP.
+Certificate renewal is picked up automatically on the next connection; no restart is needed. Without these flags, or if the certificate cannot be loaded at startup, the server uses plain HTTP so energy control keeps running.
 
 
 ## TODO
