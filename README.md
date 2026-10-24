@@ -157,7 +157,6 @@ Certificate renewal is picked up automatically on the next connection; no restar
 
 
 ## TODO
-* Add favicon from filesystem
 * Implement controls for scheduled availability
 
 ## Notice
