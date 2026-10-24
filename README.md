@@ -1,15 +1,11 @@
+
 # GARO Energy Controller
 
 Small Go service for controlling GARO GLB dynamic load balancing based on hourly grid import measured by Tibber.
 
-<img width="1186" height="319" alt="image" src="https://github.com/user-attachments/assets/5755256d-10f7-4231-b2e3-0e04f1b9a9f7" />
+<img width="1216" height="984" alt="Garo-main-page" src="https://github.com/user-attachments/assets/b8fb3c3d-cf69-478b-af44-707312a3cdf5" />
 
-<img width="1188" height="299" alt="image" src="https://github.com/user-attachments/assets/3484e001-c633-4df5-b70b-a2bdbbe0487f" />
-
-<img width="1188" height="270" alt="image" src="https://github.com/user-attachments/assets/9b9f991f-ec98-4440-8fd3-37b0eaca89d0" />
-
-<img width="1183" height="600" alt="image" src="https://github.com/user-attachments/assets/67f93073-6318-4a27-be11-88d7815c9480" />
-
+<img width="1223" height="1013" alt="Garo-settings-page" src="https://github.com/user-attachments/assets/5d27ad7b-f350-43c6-8fc6-11942e3cd9f7" />
 
 
 ## How it works
