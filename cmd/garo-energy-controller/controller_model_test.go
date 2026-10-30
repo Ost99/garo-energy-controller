@@ -6,185 +6,288 @@ import (
 	"time"
 )
 
-// garoPlant simulates GARO LB100 + one three-phase car, using the behaviour
-// observed in the 2026-10-10 logs: GARO limits the worst phase to
-// DLM × (1 − reserve), drops the pilot immediately, raises it 1 A per
-// pilotStepSeconds, and the car follows the pilot with a first-order lag.
-type garoPlant struct {
-	reserve          float64
-	pilotStepSeconds float64
-	carTau           float64
-	carMaxA          float64
+// garoSim is a single-car GARO plant built from the October 2026
+// measurements (TODO.md). Its parameters are deliberately varied around the
+// values the model assumes, so the tests check robustness, not
+// self-consistency.
+type garoSim struct {
+	raiseRoomA    float64 // raise when every phase has this much room
+	cutOverA      float64 // cut when a phase is this far over DLM
+	stepUpA       int     // pilot step per raise
+	updateSeconds float64 // GARO update interval; it acts on the previous update's reading
 
-	pilotA      float64
-	carA        float64
-	sinceRaiseS float64
+	carPhases [3]bool
+	carMaxA   float64 // car draws min(pilot, carMaxA) − carBelowA
+	carBelowA float64
+	carTau    float64
+
+	dlm      int
+	pilot    int
+	carA     float64
+	measured [3]float64 // site currents as GARO saw them at its last update
+	sinceUpd float64
 }
 
-func (p *garoPlant) step(dt float64, dlm int, household [3]float64) {
-	worst := math.Max(household[0], math.Max(household[1], household[2]))
-	allowed := math.Floor(float64(dlm)*(1-p.reserve) - worst)
-	allowed = math.Max(6, math.Min(p.carMaxA, allowed))
-
-	p.sinceRaiseS += dt
-	switch {
-	case allowed < p.pilotA:
-		p.pilotA = allowed
-	case allowed > p.pilotA && p.sinceRaiseS >= p.pilotStepSeconds:
-		p.pilotA++
-		p.sinceRaiseS = 0
+func (g *garoSim) site(household [3]float64) [3]float64 {
+	var s [3]float64
+	for p := 0; p < 3; p++ {
+		s[p] = household[p]
+		if g.carPhases[p] {
+			s[p] += g.carA
+		}
 	}
-	p.carA += (p.pilotA - p.carA) * (1 - math.Exp(-dt/p.carTau))
+	return s
+}
+
+func (g *garoSim) step(dt float64, household [3]float64) {
+	g.sinceUpd += dt
+	if g.sinceUpd >= g.updateSeconds {
+		g.sinceUpd = 0
+		over, room := -100.0, 100.0
+		for p := 0; p < 3; p++ {
+			over = math.Max(over, g.measured[p]-float64(g.dlm))
+			room = math.Min(room, float64(g.dlm)-g.measured[p])
+		}
+		switch {
+		case over >= g.cutOverA && over > 4:
+			g.pilot = 6
+		case over >= g.cutOverA:
+			g.pilot = max(6, g.pilot-1)
+		case room >= g.raiseRoomA:
+			g.pilot = min(32, g.pilot+g.stepUpA)
+		}
+		g.measured = g.site(household) // stale until the next update
+	}
+	draw := math.Max(0, math.Min(float64(g.pilot), g.carMaxA)-g.carBelowA)
+	g.carA += (draw - g.carA) * (1 - math.Exp(-dt/g.carTau))
+}
+
+type simScenario struct {
+	carPhases   [3]bool
+	carMaxA     float64
+	household   func(sec float64) [3]float64
+	startSecond float64 // car plugged in this far into the hour
 }
 
 type simResult struct {
 	hourEnergyKWh float64
-	dlmWrites     int
-	minDLM        int
-	maxDLM        int
-	maxIntegralA  float64
-	maxGridW      float64 // after the first 5 minutes (initial ramp-up)
-	carAt5MinA    float64
+	writes        int
+	writeReasons  []string
+	peakGridW     float64 // after the first 10 minutes of charging
+	minGridW      float64
+	oscillating   bool
 }
 
-// simulateModelHour runs the model controller against the plant for one
-// hour. householdAt returns per-phase household current at second t.
-func simulateModelHour(t *testing.T, plantReserve, plantStepS float64, householdAt func(sec float64) [3]float64) simResult {
+type plantVariant struct {
+	name       string
+	raiseRoomA float64
+	cutOverA   float64
+	stepUpA    int
+	updateSec  float64
+}
+
+var plantVariants = []plantVariant{
+	{"nominal", 4.0, 1.0, 1, 10},
+	{"eager raise", 3.6, 1.0, 2, 10},
+	{"lazy raise", 4.3, 1.0, 1, 15},
+	{"tight cut", 4.0, 0.6, 1, 5},
+	{"loose cut", 4.0, 1.5, 2, 15},
+}
+
+// simulateModelHour runs one hour from 23:00 with the controller ticking
+// every 30 s, using the real pacing (populateEnergyDiagnostics) and the
+// model's DLM decisions.
+func simulateModelHour(t *testing.T, sc simScenario, v plantVariant) simResult {
 	t.Helper()
 	cfg := defaultConfig()
-	tuning := cfg.ControlTuning
-	const v = 240.0
+	cfg.ControlTuning.ControlStrategy = "model"
+	const volts = 230.0 // the controller assumes 240 W per phase amp
 	const dt = 5.0
 
-	plant := &garoPlant{reserve: plantReserve, pilotStepSeconds: plantStepS, carTau: 10, carMaxA: 16, pilotA: 6, carA: 6}
-	var model dlmModel
-	dlm := 16
-	lastChange := -1e9
-	res := simResult{minDLM: dlm, maxDLM: dlm}
-	start := time.Date(2026, 10, 10, 23, 0, 0, 0, time.Local)
+	g := &garoSim{
+		raiseRoomA: v.raiseRoomA, cutOverA: v.cutOverA, stepUpA: v.stepUpA,
+		updateSeconds: v.updateSec,
+		carPhases:     sc.carPhases, carMaxA: sc.carMaxA, carBelowA: 0.3, carTau: 10,
+		dlm: 16, pilot: 6,
+	}
+	var m dlmModel
+	start := time.Date(2026, 10, 30, 23, 0, 0, 0, time.Local)
+	lastWrite := start.Add(-time.Hour)
+	res := simResult{minGridW: math.Inf(1)}
 
-	energyKWh := 0.0
+	energy := 0.0
 	for sec := 0.0; sec < 3600; sec += dt {
-		hh := householdAt(sec)
-		plant.step(dt, dlm, hh)
+		hh := sc.household(sec)
+		charging := sec >= sc.startSecond
+		if charging {
+			g.step(dt, hh)
+		} else {
+			g.measured = hh
+		}
+		site := g.site(hh)
+		if !charging {
+			site = hh
+		}
+		gridW := (site[0] + site[1] + site[2]) * volts
+		energy += gridW * dt / 3600000.0
+		if charging && sec >= sc.startSecond+600 {
+			res.peakGridW = math.Max(res.peakGridW, gridW)
+			res.minGridW = math.Min(res.minGridW, gridW)
+		}
 
-		gridW := 0.0
-		var site, car [3]float64
-		for i := 0; i < 3; i++ {
-			car[i] = plant.carA
-			site[i] = hh[i] + plant.carA
-			gridW += site[i] * v
-		}
-		energyKWh += gridW * dt / 3600000.0
-		if sec >= 300 && gridW > res.maxGridW {
-			res.maxGridW = gridW
-		}
-		if sec == 300 {
-			res.carAt5MinA = plant.carA
-		}
-
-		if math.Mod(sec, 30) != 0 {
+		if !charging || math.Mod(sec, 30) != 0 {
 			continue
 		}
 		now := start.Add(time.Duration(sec) * time.Second)
 		var s ControllerSnapshot
-		populateEnergyDiagnostics(&s, cfg, "sim", energyKWh, gridW, now, true)
-		out := model.step(modelInput{
-			Now: now, GridW: gridW, SitePhaseA: site, CarPhaseA: car,
-			TargetW: s.EffectiveTargetPowerW, CurrentDLMA: dlm,
-			CanIncrease: true,
-			MinA:        cfg.MinimumCurrentA, MaxA: cfg.MaximumCurrentA,
-		}, tuning)
-		if out.IntegralA > res.maxIntegralA {
-			res.maxIntegralA = out.IntegralA
+		populateEnergyDiagnostics(&s, cfg, "sim", energy, gridW, now, true)
+
+		var car [3]float64
+		for p := 0; p < 3; p++ {
+			if g.carPhases[p] {
+				car[p] = g.carA
+			}
 		}
-		if out.TargetDLMA != dlm && sec-lastChange >= float64(tuning.NormalDwellSeconds) {
-			dlm = out.TargetDLMA
-			lastChange = sec
-			res.dlmWrites++
-			if dlm < res.minDLM {
-				res.minDLM = dlm
-			}
-			if dlm > res.maxDLM {
-				res.maxDLM = dlm
-			}
+		out := m.step(modelInput{
+			Now: now, GridW: gridW, SitePhaseA: site, CarPhaseA: car,
+			CarPhases: g.carPhases, PilotA: g.pilot, MaxPilotA: 32,
+			TargetW: s.EffectiveTargetPowerW, DLMA: g.dlm,
+			SinceWrite: now.Sub(lastWrite),
+			MinA:       cfg.MinimumCurrentA, MaxA: cfg.MaximumCurrentA,
+			WattsPerPhaseAmp: cfg.ControlTuning.OnePhaseWattsPerAmp,
+		})
+		res.oscillating = res.oscillating || out.Oscillating
+		if out.DLMA != g.dlm {
+			g.dlm = out.DLMA
+			lastWrite = now
+			res.writes++
+			res.writeReasons = append(res.writeReasons, out.Reason)
 		}
 	}
-	res.hourEnergyKWh = energyKWh
+	res.hourEnergyKWh = energy
 	return res
 }
 
-// The controller assumes model_reserve_fraction 0.11. The plant uses a
-// range of reserves and pilot ramp rates around the observed values, so
-// the tests check robustness to model error, not self-consistency.
-var plantVariants = []struct{ reserve, pilotStepS float64 }{
-	{0.06, 10}, {0.06, 25}, {0.11, 10}, {0.11, 25}, {0.16, 10}, {0.16, 25},
+var (
+	threePhase = [3]bool{true, true, true}
+	onePhaseL2 = [3]bool{false, true, false}
+)
+
+func steadyHousehold(h [3]float64) func(float64) [3]float64 {
+	return func(float64) [3]float64 { return h }
 }
 
-func TestModelCyclingSinglePhaseLoad(t *testing.T) {
-	// The 2026-10-10 23:30 situation: ~3 A base household per phase plus
-	// a ~11 A load on L2 cycling about once a minute.
-	cycling := func(sec float64) [3]float64 {
-		l2 := 3.4
-		if math.Mod(sec, 70) < 35 {
-			l2 += 11
-		}
-		return [3]float64{3.1, l2, 1.6}
+func checkHour(t *testing.T, name string, r simResult, minKWh float64, maxWrites int) {
+	t.Helper()
+	limit := defaultConfig().HourlyLimitKWh
+	t.Logf("%s: %.2f kWh, %d writes, grid %.0f..%.0f W, oscillating %v",
+		name, r.hourEnergyKWh, r.writes, r.minGridW, r.peakGridW, r.oscillating)
+	if r.hourEnergyKWh > limit {
+		t.Errorf("%s: %.3f kWh over the %.1f kWh limit", name, r.hourEnergyKWh, limit)
 	}
-	// Regulation is measured against the target, not the absolute limit;
-	// the limit belongs to the hard stop, which this simulation excludes.
-	cfg := defaultConfig()
-	targetKWh := cfg.HourlyLimitKWh - cfg.TargetMarginWh/1000.0
+	if r.hourEnergyKWh < minKWh {
+		t.Errorf("%s: %.3f kWh, want at least %.2f", name, r.hourEnergyKWh, minKWh)
+	}
+	if r.writes > maxWrites {
+		t.Errorf("%s: %d DLM writes, want at most %d: %v", name, r.writes, maxWrites, r.writeReasons)
+	}
+}
+
+func TestModelThreePhaseSteadyHousehold(t *testing.T) {
 	for _, v := range plantVariants {
-		r := simulateModelHour(t, v.reserve, v.pilotStepS, cycling)
-		t.Logf("reserve %.2f, pilot step %.0f s: %.2f kWh, %d DLM writes, DLM %d..%d A, max integral %.2f A, peak grid %.0f W",
-			v.reserve, v.pilotStepS, r.hourEnergyKWh, r.dlmWrites, r.minDLM, r.maxDLM, r.maxIntegralA, r.maxGridW)
-		if r.hourEnergyKWh > targetKWh {
-			t.Errorf("reserve %.2f, step %.0f s: %.3f kWh over the %.3f kWh target",
-				v.reserve, v.pilotStepS, r.hourEnergyKWh, targetKWh)
-		}
-		// Ending under target is preferred over swings: GARO cuts the car on
-		// every load cycle, and the controller must not chase that loss.
-		if r.hourEnergyKWh < targetKWh-1.5 {
-			t.Errorf("reserve %.2f, step %.0f s: %.3f kWh leaves too much budget unused",
-				v.reserve, v.pilotStepS, r.hourEnergyKWh)
-		}
-		// Before the integral fix: integral 2.8-5.6 A, peak grid 11.0-11.7 kW.
-		if r.maxIntegralA > 1.0 {
-			t.Errorf("reserve %.2f, step %.0f s: integral wound up to %.2f A",
-				v.reserve, v.pilotStepS, r.maxIntegralA)
-		}
-		if r.maxGridW > 10500 {
-			t.Errorf("reserve %.2f, step %.0f s: grid peaked at %.0f W",
-				v.reserve, v.pilotStepS, r.maxGridW)
-		}
-		if r.dlmWrites > 15 {
-			t.Errorf("reserve %.2f, step %.0f s: %d DLM writes in one hour",
-				v.reserve, v.pilotStepS, r.dlmWrites)
+		r := simulateModelHour(t, simScenario{
+			carPhases: threePhase, carMaxA: 16,
+			household: steadyHousehold([3]float64{4.5, 1, 2}),
+		}, v)
+		checkHour(t, "3-phase steady/"+v.name, r, 8.8, 12)
+		if swing := r.peakGridW - r.minGridW; swing > 2500 {
+			t.Errorf("3-phase steady/%s: grid swings %.0f W in steady state", v.name, swing)
 		}
 	}
 }
 
-func TestModelSteadyHouseholdRampUp(t *testing.T) {
-	steady := func(float64) [3]float64 { return [3]float64{3, 2, 2} }
-	cfg := defaultConfig()
-	targetKWh := cfg.HourlyLimitKWh - cfg.TargetMarginWh/1000.0
+func TestModelOnePhaseCarFreePhaseBlocksRaise(t *testing.T) {
+	// 1-phase car on L2 while L1 (no car) carries 10 A of household load:
+	// GARO cannot raise past L1, and the model must not keep writing.
 	for _, v := range plantVariants {
-		r := simulateModelHour(t, v.reserve, v.pilotStepS, steady)
-		t.Logf("reserve %.2f, pilot step %.0f s: %.2f kWh, %d DLM writes, car %.1f A after 5 min",
-			v.reserve, v.pilotStepS, r.hourEnergyKWh, r.dlmWrites, r.carAt5MinA)
-		if r.hourEnergyKWh > targetKWh || r.hourEnergyKWh < targetKWh-0.3 {
-			t.Errorf("reserve %.2f, step %.0f s: %.3f kWh, want %.3f..%.3f",
-				v.reserve, v.pilotStepS, r.hourEnergyKWh, targetKWh-0.3, targetKWh)
+		r := simulateModelHour(t, simScenario{
+			carPhases: onePhaseL2, carMaxA: 28,
+			household: steadyHousehold([3]float64{10, 1, 2}),
+		}, v)
+		checkHour(t, "1-phase blocked/"+v.name, r, 0, 6)
+	}
+}
+
+func TestModelOnePhaseSelfLimitedCar(t *testing.T) {
+	// The car stops at 28 A whatever the pilot: no writes chasing it.
+	for _, v := range plantVariants {
+		r := simulateModelHour(t, simScenario{
+			carPhases: onePhaseL2, carMaxA: 28,
+			household: steadyHousehold([3]float64{2, 1, 2}),
+		}, v)
+		checkHour(t, "1-phase self-limited/"+v.name, r, 0, 6)
+	}
+}
+
+func TestModelCyclingLoadOnCarPhase(t *testing.T) {
+	// A 2.5 kW element on L1 switching on for 20 s every 60 s: GARO cuts the
+	// car on every burst. The model must recognise it and not chase.
+	burst := func(sec float64) [3]float64 {
+		h := [3]float64{4.5, 1, 2}
+		if math.Mod(sec, 60) < 20 {
+			h[0] += 11
 		}
-		// Target ~9.5 kW with ~1.7 kW household: ~10.8 A car.
-		if r.carAt5MinA < 9.5 {
-			t.Errorf("reserve %.2f, step %.0f s: car at %.1f A after 5 min",
-				v.reserve, v.pilotStepS, r.carAt5MinA)
+		return h
+	}
+	for _, v := range plantVariants {
+		r := simulateModelHour(t, simScenario{carPhases: threePhase, carMaxA: 16, household: burst}, v)
+		checkHour(t, "3-phase cycling load/"+v.name, r, 0, 12)
+		if !r.oscillating {
+			t.Errorf("3-phase cycling load/%s: oscillation not recognised", v.name)
 		}
-		if r.dlmWrites > 15 {
-			t.Errorf("reserve %.2f, step %.0f s: %d DLM writes in one hour",
-				v.reserve, v.pilotStepS, r.dlmWrites)
+	}
+}
+
+func TestModelMidHourStart(t *testing.T) {
+	for _, v := range plantVariants {
+		r := simulateModelHour(t, simScenario{
+			carPhases: threePhase, carMaxA: 16, startSecond: 1500,
+			household: steadyHousehold([3]float64{4.5, 1, 2}),
+		}, v)
+		checkHour(t, "3-phase mid-hour start/"+v.name, r, 0, 12)
+	}
+}
+
+func TestModelSingleCarScope(t *testing.T) {
+	base := ControllerSnapshot{
+		PilotValid:        true,
+		PhaseMode:         "one-phase",
+		Central101Phase1A: 0, Central101Phase2A: 10, Central101Phase3A: 0,
+	}
+
+	two := base
+	two.PilotLevels = []GaroPilotLevel{{SerialNumber: 2, Charging: true}, {SerialNumber: 1, Charging: true}}
+	if _, _, reason := modelSingleCar(two); reason == "" {
+		t.Error("two charging chargers accepted")
+	}
+
+	ok := base
+	ok.PilotLevels = []GaroPilotLevel{{SerialNumber: 2, Charging: true, PhaseRotation: 32}, {SerialNumber: 1}}
+	if _, phases, reason := modelSingleCar(ok); reason != "" || phases != [3]bool{false, true, false} {
+		t.Errorf("single 1-phase car on L2 rejected: %q %v", reason, phases)
+	}
+
+	mismatch := base
+	mismatch.PilotLevels = []GaroPilotLevel{{SerialNumber: 2, Charging: true, PhaseRotation: 16}}
+	if _, _, reason := modelSingleCar(mismatch); reason == "" {
+		t.Error("rotation/CENTRAL101 mismatch not detected")
+	}
+}
+
+func TestRotationFirstPhase(t *testing.T) {
+	for phase, want := range map[int]int{16: 1, 32: 2, 48: 3, 0: 0, 64: 0} {
+		if got := rotationFirstPhase(phase); got != want {
+			t.Errorf("rotationFirstPhase(%d) = %d, want %d", phase, got, want)
 		}
 	}
 }
@@ -195,43 +298,21 @@ func TestModelStrategyIsOptIn(t *testing.T) {
 	}
 }
 
-func TestModelNoIncreaseWhenNotAllowed(t *testing.T) {
+func TestModelRaiseBlockedByCarFreePhase(t *testing.T) {
+	// 1-phase car at 8 A on L2; L1 (no car) carries 14 A of household load.
+	// GARO only raises with ~4 A room on every phase, so any DLM that allows
+	// a raise lets GARO take the car far past the wanted ~10 A: hold.
 	var m dlmModel
-	tuning := defaultConfig().ControlTuning
-	now := time.Now()
+	now := time.Date(2026, 10, 30, 23, 30, 0, 0, time.Local)
 	in := modelInput{
-		Now: now, GridW: 3000,
-		SitePhaseA: [3]float64{10, 6, 6}, CarPhaseA: [3]float64{6, 6, 6},
-		TargetW: 9500, CurrentDLMA: 16, CanIncrease: false, MinA: 6, MaxA: 50,
+		Now: now, GridW: (14 + 9 + 2) * 240,
+		SitePhaseA: [3]float64{14, 9, 2}, CarPhaseA: [3]float64{0, 8, 0},
+		CarPhases: onePhaseL2, PilotA: 8, MaxPilotA: 32,
+		TargetW: (14+1+2)*240 + 10.5*240, DLMA: 16, SinceWrite: time.Hour,
+		MinA: 6, MaxA: 50, WattsPerPhaseAmp: 240,
 	}
-	for i := 0; i < 20; i++ {
-		in.Now = now.Add(time.Duration(i*30) * time.Second)
-		out := m.step(in, tuning)
-		if out.TargetDLMA > 16 {
-			t.Fatalf("DLM raised to %d A while increases are not allowed", out.TargetDLMA)
-		}
-	}
-	if m.integralA != 0 {
-		t.Fatalf("integral wound up to %.2f A while pinned", m.integralA)
-	}
-}
-
-func TestModelRecoversInFinalMinutes(t *testing.T) {
-	// 2026-10-24 20:56: the model reduced DLM 15 -> 13 on a lagging average
-	// and was then held at 13 A for the rest of the hour by the final-window
-	// no-increase rule while its own target rose to 18 A.
-	cfg := defaultConfig()
-	cfg.ControlTuning.ControlStrategy = "model"
-	c := &EnergyController{}
-	s := ControllerSnapshot{
-		SecondsRemaining:      120,
-		EffectiveTargetPowerW: 9400,
-		PhaseMode:             "multi-phase",
-		Central100Phase1A:     11.6, Central100Phase2A: 9.0, Central100Phase3A: 9.0,
-		Central101Phase1A: 7.6, Central101Phase2A: 7.6, Central101Phase3A: 7.6,
-	}
-	target := c.modelDecision(&s, cfg, time.Now(), 6000, 13, 2*time.Minute)
-	if target <= 13 {
-		t.Fatalf("model held DLM at %d A in the final minutes: %s", target, s.Decision)
+	out := m.step(in)
+	if out.DLMA != in.DLMA {
+		t.Fatalf("raised DLM to %d although GARO would overshoot: %s", out.DLMA, out.Reason)
 	}
 }

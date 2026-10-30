@@ -8,9 +8,6 @@ import (
 func TestSettingsPageControlStrategyFields(t *testing.T) {
 	for _, key := range []string{
 		"control_strategy",
-		"model_reserve_fraction",
-		"model_kp",
-		"model_integral_seconds",
 	} {
 		// Loaded into the form (t.<key>) and sent back on save (<key>:).
 		if !strings.Contains(settingsPage, "t."+key) {

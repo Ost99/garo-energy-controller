@@ -1276,8 +1276,15 @@ func (c *EnergyController) tick() {
 	// Regulation uses the target, not the absolute limit. Once the target is
 	// reached, hold the minimum current for the rest of the hour; an
 	// exhausted absolute limit is handled by hardStopRequired() above.
+	useModel := false
+	modelFallback := ""
 	if remainingEnergy > 0 && cfg.ControlTuning.ControlStrategy == "model" {
-		target = c.modelDecision(&s, cfg, now, gridPower, currentLimit, adjustmentAge)
+		target, useModel, modelFallback = c.modelDecision(
+			&s, cfg, now, gridPower, currentLimit, adjustmentAge)
+	}
+
+	if useModel {
+		// Decision already set by the model.
 	} else if remainingEnergy <= 0 {
 		target = cfg.MinimumCurrentA
 		s.Decision = "hourly target reached"
@@ -1460,6 +1467,10 @@ func (c *EnergyController) tick() {
 		}
 	}
 
+	if modelFallback != "" {
+		s.Decision = "model not used (" + modelFallback + "); incremental: " + s.Decision
+	}
+
 	if target < cfg.MinimumCurrentA {
 		target = cfg.MinimumCurrentA
 	}
@@ -1500,8 +1511,9 @@ func (c *EnergyController) tick() {
 	c.setSnapshot(s)
 }
 
-// modelDecision runs one step of the model-based controller and returns the
-// DLM target for this tick (currentLimit when holding).
+// modelDecision runs one step of the model controller. ok is false when the
+// current charging configuration is outside the model's scope; reason then
+// says why, and the caller uses the incremental controller for this tick.
 func (c *EnergyController) modelDecision(
 	s *ControllerSnapshot,
 	cfg Config,
@@ -1509,8 +1521,12 @@ func (c *EnergyController) modelDecision(
 	gridPower float64,
 	currentLimit int,
 	adjustmentAge time.Duration,
-) int {
-	pilotsSaturated, saturationSummary := activePilotsSaturated(*s)
+) (target int, ok bool, reason string) {
+	car, carPhases, reason := modelSingleCar(*s)
+	if reason != "" {
+		c.model.reset()
+		return currentLimit, false, reason
+	}
 
 	out := c.model.step(modelInput{
 		Now:   now,
@@ -1521,49 +1537,61 @@ func (c *EnergyController) modelDecision(
 		CarPhaseA: [3]float64{
 			s.Central101Phase1A, s.Central101Phase2A, s.Central101Phase3A,
 		},
-		TargetW:     s.EffectiveTargetPowerW,
-		CurrentDLMA: currentLimit,
-		OnePhase:    s.PhaseMode == "one-phase",
-		// The final-minutes no-increase rule (noIncreaseFinalSeconds) is
-		// for the incremental controller's late catch-up ramps. The model's
-		// target already fades catch-up and is capped by the hard budget
-		// ceiling, so in the final minutes an increase is recovery from an
-		// over-reduction, not catch-up.
-		CanIncrease: !pilotsSaturated,
-		MinA:        cfg.MinimumCurrentA,
-		MaxA:        cfg.MaximumCurrentA,
-	}, cfg.ControlTuning)
+		CarPhases:        carPhases,
+		PilotA:           car.PilotA,
+		MaxPilotA:        car.MaxPilotA,
+		TargetW:          s.EffectiveTargetPowerW,
+		DLMA:             currentLimit,
+		SinceWrite:       adjustmentAge,
+		MinA:             cfg.MinimumCurrentA,
+		MaxA:             cfg.MaximumCurrentA,
+		WattsPerPhaseAmp: cfg.ControlTuning.OnePhaseWattsPerAmp,
+	})
 
-	summary := fmt.Sprintf(
-		"car setpoint %.1f A (ff %.1f, p %.1f, i %.1f), avg grid %.0f W, "+
-			"worst-phase household %.1f A -> DLM %.1f A",
-		out.CarSetpointA, out.FeedForwardA, out.ProportionalA, out.IntegralA,
-		out.GridAvgW, out.WorstHouseholdAvgA, out.DesiredDLMA,
+	s.Decision = fmt.Sprintf(
+		"model: %s (pilot %d A, wanted %.1f A, busiest phase %.1f A, household avg %.0f W)",
+		out.Reason, car.PilotA, out.WantPilotA, out.BusiestA, out.HouseholdAvgW,
 	)
+	return out.DLMA, true, ""
+}
 
-	normalDwell := time.Duration(cfg.ControlTuning.NormalDwellSeconds) * time.Second
-
-	switch {
-	case out.TargetDLMA == currentLimit:
-		reason := "within hysteresis"
-		if out.DesiredDLMA > float64(currentLimit) && pilotsSaturated {
-			reason = "active GARO pilots saturated (" + saturationSummary + ")"
-		}
-		s.Decision = "model hold: " + reason + "; " + summary
-		return currentLimit
-
-	case adjustmentAge < normalDwell:
-		s.Decision = fmt.Sprintf(
-			"model hold %d A: waiting for previous DLM change (%ds/%ds); %s",
-			out.TargetDLMA,
-			int(adjustmentAge.Seconds()),
-			int(normalDwell.Seconds()),
-			summary,
-		)
-		return currentLimit
-
-	default:
-		s.Decision = "model: " + summary
-		return out.TargetDLMA
+// modelSingleCar returns the one charging charger and the phases its car
+// draws on, or a reason why the model does not apply.
+func modelSingleCar(s ControllerSnapshot) (GaroPilotLevel, [3]bool, string) {
+	var phases [3]bool
+	if !s.PilotValid || s.PilotStale {
+		return GaroPilotLevel{}, phases, "GARO pilot data unavailable"
 	}
+
+	var charging []GaroPilotLevel
+	for _, level := range s.PilotLevels {
+		if level.Charging {
+			charging = append(charging, level)
+		}
+	}
+	if len(charging) != 1 {
+		return GaroPilotLevel{}, phases,
+			fmt.Sprintf("%d chargers charging; the model handles one car", len(charging))
+	}
+	car := charging[0]
+
+	currents := [3]float64{s.Central101Phase1A, s.Central101Phase2A, s.Central101Phase3A}
+	switch s.PhaseMode {
+	case "three-phase":
+		phases = [3]bool{true, true, true}
+	case "one-phase":
+		for p, current := range currents {
+			phases[p] = math.Abs(current) >= chargingThresholdA
+		}
+		// GARO protects the phase its rotation setting names; if the car
+		// draws on another one, GARO limits the wrong phase.
+		if want := rotationFirstPhase(car.PhaseRotation); want != 0 && !phases[want-1] {
+			return car, phases, fmt.Sprintf(
+				"WARNING: charger %d rotation says L%d but the 1-phase car draws on another phase; GARO protects the wrong phase",
+				car.SerialNumber, want)
+		}
+	default:
+		return car, phases, "car phases not recognised (" + s.PhaseMode + ")"
+	}
+	return car, phases, ""
 }

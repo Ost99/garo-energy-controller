@@ -582,10 +582,27 @@ type GaroPilotLevel struct {
 	PilotA            int    `json:"pilot_a"`
 	MaxPilotA         int    `json:"max_pilot_a,omitempty"`
 	Connector         string `json:"connector,omitempty"`
+	ChargeStatus      int    `json:"charge_status,omitempty"`
+	PhaseRotation     int    `json:"phase_rotation,omitempty"`
 	Charging          bool   `json:"charging"`
 	Saturated         bool   `json:"saturated"`
 	LoadBalanced      bool   `json:"load_balanced"`
 	LoadBalancedKnown bool   `json:"load_balanced_known"`
+}
+
+// garoChargeStatusCharging is /slaves/false chargeStatus for an EVSE that is
+// charging (16/80 idle, 144 unavailable).
+const garoChargeStatusCharging = 64
+
+// rotationFirstPhase returns the phase (1–3) GARO assumes a 1-phase car uses
+// on a charger with this rotation (/slaves/false "phase": 16 = L1-L2-L3,
+// 32 = L2-L3-L1, 48 = L3-L1-L2), or 0 when unknown.
+func rotationFirstPhase(phase int) int {
+	switch phase {
+	case 16, 32, 48:
+		return phase / 16
+	}
+	return 0
 }
 
 type GaroFastInfo struct {
@@ -602,11 +619,15 @@ func (g *GaroClient) GetFastInfo() (GaroFastInfo, error) {
 		PilotLevel   int    `json:"pilotLevel"`
 		Mode         string `json:"mode"`
 		Connector    string `json:"connector"`
+		ChargeStatus int    `json:"chargeStatus"`
+		Phase        int    `json:"phase"`
 		LoadBalanced *bool  `json:"loadBalanced"`
 	}
 	type pilotState struct {
 		PilotA            int
 		Connector         string
+		ChargeStatus      int
+		Phase             int
 		LoadBalanced      bool
 		LoadBalancedKnown bool
 	}
@@ -676,8 +697,10 @@ func (g *GaroClient) GetFastInfo() (GaroFastInfo, error) {
 	for _, slave := range slaves {
 		if slave.SerialNumber != 0 {
 			state := pilotState{
-				PilotA:    slave.PilotLevel,
-				Connector: slave.Connector,
+				PilotA:       slave.PilotLevel,
+				Connector:    slave.Connector,
+				ChargeStatus: slave.ChargeStatus,
+				Phase:        slave.Phase,
 			}
 			if slave.LoadBalanced != nil {
 				state.LoadBalanced = *slave.LoadBalanced
@@ -691,12 +714,18 @@ func (g *GaroClient) GetFastInfo() (GaroFastInfo, error) {
 	for serial, state := range levels {
 		connector := strings.ToUpper(strings.TrimSpace(state.Connector))
 		maxPilotA := capabilities.MaxPilotA(serial)
+		// The slave reports connector INITIALIZATION while charging;
+		// chargeStatus 64 is reliable for both chargers.
+		charging := connector == "CHARGING" ||
+			state.ChargeStatus == garoChargeStatusCharging
 		info.PilotLevels = append(info.PilotLevels, GaroPilotLevel{
 			SerialNumber:      serial,
 			PilotA:            state.PilotA,
 			MaxPilotA:         maxPilotA,
 			Connector:         connector,
-			Charging:          connector == "CHARGING",
+			ChargeStatus:      state.ChargeStatus,
+			PhaseRotation:     state.Phase,
+			Charging:          charging,
 			Saturated:         maxPilotA > 0 && state.PilotA >= maxPilotA,
 			LoadBalanced:      state.LoadBalanced,
 			LoadBalancedKnown: state.LoadBalancedKnown,

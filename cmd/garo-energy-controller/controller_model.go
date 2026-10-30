@@ -1,212 +1,294 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"time"
 )
 
-// Model-based DLM control. Opt-in (control_strategy "model") until tested
-// on the real installation.
+// Model controller (opt-in, control_strategy "model").
 //
-// Plant model, from the 2026-10-10 logs:
+// It works with GARO's load-balancing band instead of steering pilots
+// directly (measured October 2026, see TODO.md). With S_p the CENTRAL100
+// current on phase p:
 //
-//	car current per phase ≈ DLM × (1 − k) − worst-phase household current
+//   - GARO cuts the cars on a phase when S_p ≥ DLM + ~1 A.
+//   - GARO raises only when every phase, including phases without a car,
+//     has DLM − S_p ≥ ~4 A, one step per update, until the room is gone.
+//   - In between it holds, so DLM changes inside the band do nothing.
+//   - Large DLM drops overcut (GARO acts again on stale readings).
 //
-// clamped to [6 A, pilot ceiling], where k is GARO's reserve fraction and
-// household current is CENTRAL100 − CENTRAL101 per phase.
+// So the model:
 //
-// Unverified assumptions (check these first if it misbehaves):
-//   - CENTRAL100 L1/L2/L3 line up with CENTRAL101 L1/L2/L3.
-//   - The reserve is proportional to DLM (observed smaller at low DLM; the
-//     exact shape is unknown). k ≈ 0.11 was fitted to one sample at 22 A.
-//   - A one-phase car is limited by the worst household phase, not only its
-//     own phase. Not observed; no data for one-phase charging.
+//   - raises in one write, to the DLM at which GARO's own ramp stops at the
+//     wanted car current;
+//   - lowers 1 A below the busiest phase per write, waiting for GARO to
+//     settle between steps;
+//   - otherwise keeps DLM about modelHoldRoomA above the busiest phase:
+//     below GARO's raise threshold, with room for household bursts;
+//   - never writes inside the band, and stops chasing when GARO keeps
+//     cutting for a cycling household load.
 //
-// Structure (cascade):
-//   - Outer loop (unchanged): hourly energy pacing produces the power
-//     setpoint (EffectiveTargetPowerW), i.e. integral action on energy.
-//   - Inner loop (this file): feed-forward from averaged household power
-//     gives the car current the setpoint allows, a PI term on averaged grid
-//     power corrects model error, and the plant model is inverted to the
-//     DLM value that GARO turns into that car current. One write per change.
+// The power setpoint comes from hourly pacing (EffectiveTargetPowerW), which
+// already integrates the energy error, so there is no inner PI term.
 //
-// No derivative term: inputs are 30 s samples of a signal that cycles with
-// household loads, and a D term would amplify exactly those swings. The
-// household feed-forward provides the anticipation a D term would add.
-//
-// A household load cycling faster than the averaging window moves the
-// average DLM slightly instead of on every cycle. GARO still swings the car
-// with the load on its own; no single DLM value can prevent that.
+// Scope: exactly one charging car (1- or 3-phase). Other configurations use
+// the incremental controller (see modelDecision).
 
 const (
-	// modelAverageSeconds is the EMA time constant for all inputs.
-	modelAverageSeconds = 180.0
+	// garoRaiseRoomA: GARO raises only when every phase has this much room.
+	// Measured: no raise at 3.6–3.8 A, raise at 4.1 A.
+	garoRaiseRoomA = 4.0
 
-	// modelHysteresisA: DLM is only written when the desired value is at
-	// least this far from the current one. Fewer writes to GARO's SD card,
-	// and no dithering between adjacent amps.
-	modelHysteresisA = 1.0
+	// modelRaiseLandingRoomA: GARO's ramp stops with about this much room
+	// on the car's phases (just under garoRaiseRoomA, 1 A steps).
+	modelRaiseLandingRoomA = 3.0
 
-	// modelCarFollowBandA: the car counts as held below the model when its
-	// highest phase current is more than this below the car current the
-	// model predicts for the current DLM.
-	modelCarFollowBandA = 1.5
+	// modelHoldRoomA: hold DLM this far above the busiest phase. Below the
+	// raise threshold, and about 3.5 A of room for bursts before GARO cuts.
+	modelHoldRoomA = 2.5
 
-	// modelIntegralLimitA bounds the integral term.
-	modelIntegralLimitA = 6.0
+	// modelSettle: after a DLM write, GARO and the car need 1–2 minutes.
+	modelSettle = 90 * time.Second
 
-	// modelResetGap: a gap between samples longer than this (manual hold,
-	// GARO outage) restarts the averages from the next sample.
+	// modelOscillationSettle: slower reductions while GARO is cutting for a
+	// cycling household load.
+	modelOscillationSettle = 3 * time.Minute
+
+	// modelOscillationWindow / modelOscillationCuts: this many GARO cuts
+	// (pilot drops without a model write) within the window count as a
+	// cycling household load.
+	modelOscillationWindow = 5 * time.Minute
+	modelOscillationCuts   = 2
+
+	// modelRecentPilotWindow: raises are judged against the highest pilot
+	// in this window.
+	modelRecentPilotWindow = 2 * time.Minute
+
+	// modelHouseholdAverageSeconds: EMA time constant for household power.
+	modelHouseholdAverageSeconds = 120.0
+
+	// modelStepDeadbandA: act only when the wanted pilot differs this much
+	// from the current one. GARO moves in 1–2 A steps and can overshoot or
+	// overcut by one, so a 1 A deadband would hunt.
+	modelStepDeadbandA = 1.5
+
+	// modelCarFollowA: the car counts as following its pilot when it draws
+	// at least pilot − this.
+	modelCarFollowA = 1.5
+
+	// modelResetGap: a longer gap between samples restarts the model.
 	modelResetGap = 5 * time.Minute
 )
 
 type dlmModel struct {
-	initialised bool
-	last        time.Time
-
-	gridAvgW           float64
-	carAvgW            float64
-	worstHouseholdAvgA float64
-
-	integralA float64
+	initialised   bool
+	last          time.Time
+	householdAvgW float64
+	lastPilotA    int
+	lastLower     time.Time // last model write that lowered DLM to make GARO cut
+	pilotAtLower  int
+	garoCuts      []time.Time
+	recentPilots  []timedPilot
 }
 
-type modelInput struct {
-	Now time.Time
-
-	GridW      float64
-	SitePhaseA [3]float64 // CENTRAL100
-	CarPhaseA  [3]float64 // CENTRAL101
-
-	TargetW     float64 // EffectiveTargetPowerW
-	CurrentDLMA int
-	OnePhase    bool
-
-	// CanIncrease is false when increases would have no effect (active
-	// pilots saturated).
-	CanIncrease bool
-
-	MinA int
-	MaxA int
-}
-
-type modelOutput struct {
-	GridAvgW           float64
-	WorstHouseholdAvgA float64
-
-	FeedForwardA  float64
-	ProportionalA float64
-	IntegralA     float64
-	CarSetpointA  float64
-
-	DesiredDLMA float64 // continuous, before hysteresis
-	TargetDLMA  int     // after hysteresis and limits
+type timedPilot struct {
+	at     time.Time
+	pilotA int
 }
 
 func (m *dlmModel) reset() { *m = dlmModel{} }
 
-func (m *dlmModel) step(in modelInput, t ControlTuningConfig) modelOutput {
+type modelInput struct {
+	Now   time.Time
+	GridW float64
+
+	SitePhaseA [3]float64 // CENTRAL100
+	CarPhaseA  [3]float64 // CENTRAL101
+	CarPhases  [3]bool    // phases the charging car draws on
+
+	PilotA    int
+	MaxPilotA int // 0 = unknown
+
+	TargetW    float64 // EffectiveTargetPowerW
+	DLMA       int
+	SinceWrite time.Duration
+
+	MinA int
+	MaxA int
+
+	WattsPerPhaseAmp float64 // OnePhaseWattsPerAmp
+}
+
+type modelOutput struct {
+	DLMA          int // equal to input DLMA when holding
+	WantPilotA    float64
+	HouseholdAvgW float64
+	BusiestA      float64
+	Oscillating   bool
+	Reason        string
+}
+
+func (m *dlmModel) step(in modelInput) modelOutput {
 	carW := 0.0
-	maxCarA := 0.0
-	worstHouseholdA := 0.0
-	for i := 0; i < 3; i++ {
-		carW += in.CarPhaseA[i] * t.OnePhaseWattsPerAmp
-		maxCarA = math.Max(maxCarA, in.CarPhaseA[i])
-		if h := in.SitePhaseA[i] - in.CarPhaseA[i]; h > worstHouseholdA {
-			worstHouseholdA = h
+	nPhases := 0
+	carMaxA := 0.0
+	busiestA := 0.0
+	busiestCarA := 0.0
+	busiestFreeA := 0.0
+	for p := 0; p < 3; p++ {
+		carW += in.CarPhaseA[p] * in.WattsPerPhaseAmp
+		busiestA = math.Max(busiestA, in.SitePhaseA[p])
+		if in.CarPhases[p] {
+			nPhases++
+			carMaxA = math.Max(carMaxA, in.CarPhaseA[p])
+			busiestCarA = math.Max(busiestCarA, in.SitePhaseA[p])
+		} else {
+			busiestFreeA = math.Max(busiestFreeA, in.SitePhaseA[p])
 		}
 	}
+	householdW := in.GridW - carW
 
-	dt := 0.0
 	if m.initialised {
-		dt = in.Now.Sub(m.last).Seconds()
+		dt := in.Now.Sub(m.last).Seconds()
 		if dt <= 0 || dt > modelResetGap.Seconds() {
 			m.reset()
+		} else {
+			alpha := 1 - math.Exp(-dt/modelHouseholdAverageSeconds)
+			m.householdAvgW += alpha * (householdW - m.householdAvgW)
+
+			// A pilot drop the model did not ask for is a GARO cut. The model
+			// lowers 1 A at a time, so a larger drop is GARO's own as well.
+			drop := m.lastPilotA - in.PilotA
+			if drop >= 3 || (drop > 0 && in.Now.Sub(m.lastLower) > modelSettle) {
+				m.garoCuts = append(m.garoCuts, in.Now)
+			}
 		}
 	}
-
 	if !m.initialised {
 		m.initialised = true
-		m.gridAvgW = in.GridW
-		m.carAvgW = carW
-		m.worstHouseholdAvgA = worstHouseholdA
-		dt = 0
-	} else {
-		alpha := 1 - math.Exp(-dt/modelAverageSeconds)
-		m.gridAvgW += alpha * (in.GridW - m.gridAvgW)
-		m.carAvgW += alpha * (carW - m.carAvgW)
-		m.worstHouseholdAvgA += alpha * (worstHouseholdA - m.worstHouseholdAvgA)
+		m.householdAvgW = householdW
 	}
 	m.last = in.Now
+	m.lastPilotA = in.PilotA
 
-	wattsPerAmp := t.MultiPhaseWattsPerAmp
-	if in.OnePhase {
-		wattsPerAmp = t.OnePhaseWattsPerAmp
+	kept := m.garoCuts[:0]
+	for _, t := range m.garoCuts {
+		if in.Now.Sub(t) <= modelOscillationWindow {
+			kept = append(kept, t)
+		}
+	}
+	m.garoCuts = kept
+	oscillating := len(m.garoCuts) >= modelOscillationCuts
+
+	// Highest recent pilot: a sample taken just after GARO cut the car for a
+	// household burst must not look like room to raise.
+	m.recentPilots = append(m.recentPilots, timedPilot{in.Now, in.PilotA})
+	recentMaxPilot := in.PilotA
+	keptPilots := m.recentPilots[:0]
+	for _, rp := range m.recentPilots {
+		if in.Now.Sub(rp.at) <= modelRecentPilotWindow {
+			keptPilots = append(keptPilots, rp)
+			recentMaxPilot = max(recentMaxPilot, rp.pilotA)
+		}
+	}
+	m.recentPilots = keptPilots
+
+	maxPilot := float64(in.MaxA)
+	if in.MaxPilotA > 0 {
+		maxPilot = float64(in.MaxPilotA)
+	}
+	want := (in.TargetW - m.householdAvgW) /
+		(float64(nPhases) * in.WattsPerPhaseAmp)
+	want = math.Max(float64(in.MinA), math.Min(maxPilot, want))
+
+	out := modelOutput{
+		DLMA:          in.DLMA,
+		WantPilotA:    want,
+		HouseholdAvgW: m.householdAvgW,
+		BusiestA:      busiestA,
+		Oscillating:   oscillating,
+	}
+	hold := func(reason string) modelOutput {
+		out.Reason = reason
+		return out
+	}
+	write := func(dlm int, reason string) modelOutput {
+		dlm = clampInt(dlm, in.MinA, in.MaxA)
+		if dlm == in.DLMA {
+			return hold(reason + "; already at DLM")
+		}
+		out.DLMA = dlm
+		out.Reason = reason
+		return out
 	}
 
-	householdAvgW := m.gridAvgW - m.carAvgW
-	feedForwardA := (in.TargetW - householdAvgW) / wattsPerAmp
-	errorA := (in.TargetW - m.gridAvgW) / wattsPerAmp
-	proportionalA := t.ModelKp * errorA
-
-	toDLM := func(carA float64) float64 {
-		return (carA + m.worstHouseholdAvgA) / (1 - t.ModelReserveFraction)
+	pilot := float64(in.PilotA)
+	// A car that draws less than its pilot is limited by itself; lowering the
+	// pilot above what it draws changes nothing.
+	effectivePilot := math.Min(pilot, carMaxA+modelCarFollowA)
+	settle := modelSettle
+	if oscillating {
+		settle = modelOscillationSettle
+	}
+	if in.SinceWrite < settle {
+		return hold(fmt.Sprintf("settling after DLM change (%ds/%ds)",
+			int(in.SinceWrite.Seconds()), int(settle.Seconds())))
 	}
 
-	minA := float64(in.MinA)
-	maxA := float64(in.MaxA)
+	switch {
+	case want >= float64(recentMaxPilot)+modelStepDeadbandA:
+		if oscillating {
+			return hold("GARO is cutting for a cycling household load; not chasing")
+		}
+		if in.MaxPilotA > 0 && in.PilotA >= in.MaxPilotA {
+			return hold("pilot at charger maximum")
+		}
+		if carMaxA < pilot-modelCarFollowA {
+			return hold(fmt.Sprintf("car draws %.1f A below its %d A pilot", pilot-carMaxA, in.PilotA))
+		}
+		riseA := math.Floor(want) - pilot
+		dlm := math.Max(busiestCarA+riseA+modelRaiseLandingRoomA, busiestFreeA+garoRaiseRoomA)
+		target := int(math.Ceil(dlm))
+		if expected := float64(target) - modelRaiseLandingRoomA - busiestCarA; expected > riseA+1 {
+			return hold(fmt.Sprintf(
+				"raise blocked: household on a phase without the car (%.1f A) would let GARO raise %.0f A instead of %.0f A",
+				busiestFreeA, expected, riseA))
+		}
+		if target <= in.DLMA {
+			return hold("waiting for GARO to raise")
+		}
+		return write(target, fmt.Sprintf("raise pilot %d -> ~%.0f A", in.PilotA, math.Floor(want)))
 
-	// Conditional integration (anti-windup): only integrate when the
-	// resulting output is not pinned against a limit in the direction of
-	// the error.
-	carSetpointA := feedForwardA + proportionalA + m.integralA
-	desired := toDLM(math.Max(carSetpointA, minA))
-	pinnedHigh := desired >= maxA ||
-		(!in.CanIncrease && desired >= float64(in.CurrentDLMA))
-	pinnedLow := carSetpointA <= minA || desired <= minA
+	case want <= effectivePilot-modelStepDeadbandA:
+		if in.PilotA <= in.MinA {
+			return hold("at the 6 A floor; the hard stop handles the rest")
+		}
+		// GARO cuts about 1 A per update once a phase is ~1 A over DLM. If
+		// the previous step did not trigger a cut, go one further.
+		dlm := min(int(math.Floor(busiestA))-1, in.DLMA-1)
+		m.lastLower = in.Now
+		m.pilotAtLower = in.PilotA
+		return write(dlm,
+			fmt.Sprintf("lower pilot %d A by one step (wanted %.1f A)", in.PilotA, want))
 
-	// GARO cuts the car below what the model expects from the current DLM
-	// whenever a household load cycles on the worst phase (immediately, down
-	// to the 6 A minimum), and only ramps it back slowly. Grid power is then
-	// below target, but that shortfall is not model error a higher DLM would
-	// fix: integrating it winds up, and the wound-up DLM lets the car surge
-	// each time the load switches off. Only integrate a shortfall while the
-	// car is drawing what the model predicts for the current DLM.
-	predictedCarA := float64(in.CurrentDLMA)*(1-t.ModelReserveFraction) -
-		m.worstHouseholdAvgA
-	carHeldBelowModel := maxCarA < predictedCarA-modelCarFollowBandA
-
-	if dt > 0 &&
-		!(errorA > 0 && (pinnedHigh || carHeldBelowModel)) &&
-		!(errorA < 0 && pinnedLow) {
-		m.integralA += t.ModelKp * errorA * dt / float64(t.ModelIntegralSeconds)
-		m.integralA = math.Max(-modelIntegralLimitA,
-			math.Min(modelIntegralLimitA, m.integralA))
-		carSetpointA = feedForwardA + proportionalA + m.integralA
-	}
-
-	desired = toDLM(math.Max(carSetpointA, minA))
-	desired = math.Max(minA, math.Min(maxA, desired))
-
-	current := float64(in.CurrentDLMA)
-	target := in.CurrentDLMA
-	if desired >= current+modelHysteresisA ||
-		desired <= current-modelHysteresisA {
-		target = int(math.Round(desired))
-	}
-	if !in.CanIncrease && target > in.CurrentDLMA {
-		target = in.CurrentDLMA
-	}
-	target = clampInt(target, in.MinA, in.MaxA)
-
-	return modelOutput{
-		GridAvgW:           m.gridAvgW,
-		WorstHouseholdAvgA: m.worstHouseholdAvgA,
-		FeedForwardA:       feedForwardA,
-		ProportionalA:      proportionalA,
-		IntegralA:          m.integralA,
-		CarSetpointA:       carSetpointA,
-		DesiredDLMA:        desired,
-		TargetDLMA:         target,
+	default:
+		if oscillating {
+			return hold("GARO is cutting for a cycling household load; holding DLM")
+		}
+		position := int(math.Ceil(busiestA + modelHoldRoomA))
+		minRoom := float64(in.DLMA) - busiestA
+		switch {
+		case !m.lastLower.IsZero() && in.PilotA < m.pilotAtLower && in.DLMA < position-1:
+			// After a cut the model asked for, DLM sits at the cut edge;
+			// move it up so the next household increase does not trigger
+			// another. After a cut GARO made by itself, DLM is left alone.
+			m.lastLower = time.Time{}
+			return write(position, "move DLM up into the hold position (burst room)")
+		case in.DLMA > position+1 && minRoom >= garoRaiseRoomA:
+			return write(position, "move DLM down to the hold position (stop an unwanted GARO raise)")
+		default:
+			return hold("on target")
+		}
 	}
 }
