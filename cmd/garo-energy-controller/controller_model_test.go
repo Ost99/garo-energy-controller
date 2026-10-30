@@ -42,6 +42,8 @@ type simResult struct {
 	dlmWrites     int
 	minDLM        int
 	maxDLM        int
+	maxIntegralA  float64
+	maxGridW      float64 // after the first 5 minutes (initial ramp-up)
 	carAt5MinA    float64
 }
 
@@ -74,6 +76,9 @@ func simulateModelHour(t *testing.T, plantReserve, plantStepS float64, household
 			gridW += site[i] * v
 		}
 		energyKWh += gridW * dt / 3600000.0
+		if sec >= 300 && gridW > res.maxGridW {
+			res.maxGridW = gridW
+		}
 		if sec == 300 {
 			res.carAt5MinA = plant.carA
 		}
@@ -87,9 +92,12 @@ func simulateModelHour(t *testing.T, plantReserve, plantStepS float64, household
 		out := model.step(modelInput{
 			Now: now, GridW: gridW, SitePhaseA: site, CarPhaseA: car,
 			TargetW: s.EffectiveTargetPowerW, CurrentDLMA: dlm,
-			CanIncrease: s.SecondsRemaining >= noIncreaseFinalSeconds,
+			CanIncrease: true,
 			MinA:        cfg.MinimumCurrentA, MaxA: cfg.MaximumCurrentA,
 		}, tuning)
+		if out.IntegralA > res.maxIntegralA {
+			res.maxIntegralA = out.IntegralA
+		}
 		if out.TargetDLMA != dlm && sec-lastChange >= float64(tuning.NormalDwellSeconds) {
 			dlm = out.TargetDLMA
 			lastChange = sec
@@ -129,15 +137,26 @@ func TestModelCyclingSinglePhaseLoad(t *testing.T) {
 	targetKWh := cfg.HourlyLimitKWh - cfg.TargetMarginWh/1000.0
 	for _, v := range plantVariants {
 		r := simulateModelHour(t, v.reserve, v.pilotStepS, cycling)
-		t.Logf("reserve %.2f, pilot step %.0f s: %.2f kWh, %d DLM writes, DLM %d..%d A",
-			v.reserve, v.pilotStepS, r.hourEnergyKWh, r.dlmWrites, r.minDLM, r.maxDLM)
+		t.Logf("reserve %.2f, pilot step %.0f s: %.2f kWh, %d DLM writes, DLM %d..%d A, max integral %.2f A, peak grid %.0f W",
+			v.reserve, v.pilotStepS, r.hourEnergyKWh, r.dlmWrites, r.minDLM, r.maxDLM, r.maxIntegralA, r.maxGridW)
 		if r.hourEnergyKWh > targetKWh {
 			t.Errorf("reserve %.2f, step %.0f s: %.3f kWh over the %.3f kWh target",
 				v.reserve, v.pilotStepS, r.hourEnergyKWh, targetKWh)
 		}
-		if r.hourEnergyKWh < targetKWh-0.6 {
+		// Ending under target is preferred over swings: GARO cuts the car on
+		// every load cycle, and the controller must not chase that loss.
+		if r.hourEnergyKWh < targetKWh-1.5 {
 			t.Errorf("reserve %.2f, step %.0f s: %.3f kWh leaves too much budget unused",
 				v.reserve, v.pilotStepS, r.hourEnergyKWh)
+		}
+		// Before the integral fix: integral 2.8-5.6 A, peak grid 11.0-11.7 kW.
+		if r.maxIntegralA > 1.0 {
+			t.Errorf("reserve %.2f, step %.0f s: integral wound up to %.2f A",
+				v.reserve, v.pilotStepS, r.maxIntegralA)
+		}
+		if r.maxGridW > 10500 {
+			t.Errorf("reserve %.2f, step %.0f s: grid peaked at %.0f W",
+				v.reserve, v.pilotStepS, r.maxGridW)
 		}
 		if r.dlmWrites > 15 {
 			t.Errorf("reserve %.2f, step %.0f s: %d DLM writes in one hour",
@@ -194,5 +213,25 @@ func TestModelNoIncreaseWhenNotAllowed(t *testing.T) {
 	}
 	if m.integralA != 0 {
 		t.Fatalf("integral wound up to %.2f A while pinned", m.integralA)
+	}
+}
+
+func TestModelRecoversInFinalMinutes(t *testing.T) {
+	// 2026-10-24 20:56: the model reduced DLM 15 -> 13 on a lagging average
+	// and was then held at 13 A for the rest of the hour by the final-window
+	// no-increase rule while its own target rose to 18 A.
+	cfg := defaultConfig()
+	cfg.ControlTuning.ControlStrategy = "model"
+	c := &EnergyController{}
+	s := ControllerSnapshot{
+		SecondsRemaining:      120,
+		EffectiveTargetPowerW: 9400,
+		PhaseMode:             "multi-phase",
+		Central100Phase1A:     11.6, Central100Phase2A: 9.0, Central100Phase3A: 9.0,
+		Central101Phase1A: 7.6, Central101Phase2A: 7.6, Central101Phase3A: 7.6,
+	}
+	target := c.modelDecision(&s, cfg, time.Now(), 6000, 13, 2*time.Minute)
+	if target <= 13 {
+		t.Fatalf("model held DLM at %d A in the final minutes: %s", target, s.Decision)
 	}
 }

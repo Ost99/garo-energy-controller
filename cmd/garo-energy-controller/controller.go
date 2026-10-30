@@ -1511,7 +1511,6 @@ func (c *EnergyController) modelDecision(
 	adjustmentAge time.Duration,
 ) int {
 	pilotsSaturated, saturationSummary := activePilotsSaturated(*s)
-	finalWindow := s.SecondsRemaining < noIncreaseFinalSeconds
 
 	out := c.model.step(modelInput{
 		Now:   now,
@@ -1525,7 +1524,12 @@ func (c *EnergyController) modelDecision(
 		TargetW:     s.EffectiveTargetPowerW,
 		CurrentDLMA: currentLimit,
 		OnePhase:    s.PhaseMode == "one-phase",
-		CanIncrease: !finalWindow && !pilotsSaturated,
+		// The final-minutes no-increase rule (noIncreaseFinalSeconds) is
+		// for the incremental controller's late catch-up ramps. The model's
+		// target already fades catch-up and is capped by the hard budget
+		// ceiling, so in the final minutes an increase is recovery from an
+		// over-reduction, not catch-up.
+		CanIncrease: !pilotsSaturated,
 		MinA:        cfg.MinimumCurrentA,
 		MaxA:        cfg.MaximumCurrentA,
 	}, cfg.ControlTuning)
@@ -1542,9 +1546,7 @@ func (c *EnergyController) modelDecision(
 	switch {
 	case out.TargetDLMA == currentLimit:
 		reason := "within hysteresis"
-		if out.DesiredDLMA > float64(currentLimit) && finalWindow {
-			reason = fmt.Sprintf("no increases in the final %ds", noIncreaseFinalSeconds)
-		} else if out.DesiredDLMA > float64(currentLimit) && pilotsSaturated {
+		if out.DesiredDLMA > float64(currentLimit) && pilotsSaturated {
 			reason = "active GARO pilots saturated (" + saturationSummary + ")"
 		}
 		s.Decision = "model hold: " + reason + "; " + summary

@@ -47,6 +47,11 @@ const (
 	// and no dithering between adjacent amps.
 	modelHysteresisA = 1.0
 
+	// modelCarFollowBandA: the car counts as held below the model when its
+	// highest phase current is more than this below the car current the
+	// model predicts for the current DLM.
+	modelCarFollowBandA = 1.5
+
 	// modelIntegralLimitA bounds the integral term.
 	modelIntegralLimitA = 6.0
 
@@ -77,8 +82,8 @@ type modelInput struct {
 	CurrentDLMA int
 	OnePhase    bool
 
-	// CanIncrease is false when increases are not allowed (final minutes
-	// of the hour) or would have no effect (active pilots saturated).
+	// CanIncrease is false when increases would have no effect (active
+	// pilots saturated).
 	CanIncrease bool
 
 	MinA int
@@ -102,9 +107,11 @@ func (m *dlmModel) reset() { *m = dlmModel{} }
 
 func (m *dlmModel) step(in modelInput, t ControlTuningConfig) modelOutput {
 	carW := 0.0
+	maxCarA := 0.0
 	worstHouseholdA := 0.0
 	for i := 0; i < 3; i++ {
 		carW += in.CarPhaseA[i] * t.OnePhaseWattsPerAmp
+		maxCarA = math.Max(maxCarA, in.CarPhaseA[i])
 		if h := in.SitePhaseA[i] - in.CarPhaseA[i]; h > worstHouseholdA {
 			worstHouseholdA = h
 		}
@@ -158,7 +165,20 @@ func (m *dlmModel) step(in modelInput, t ControlTuningConfig) modelOutput {
 		(!in.CanIncrease && desired >= float64(in.CurrentDLMA))
 	pinnedLow := carSetpointA <= minA || desired <= minA
 
-	if dt > 0 && !(errorA > 0 && pinnedHigh) && !(errorA < 0 && pinnedLow) {
+	// GARO cuts the car below what the model expects from the current DLM
+	// whenever a household load cycles on the worst phase (immediately, down
+	// to the 6 A minimum), and only ramps it back slowly. Grid power is then
+	// below target, but that shortfall is not model error a higher DLM would
+	// fix: integrating it winds up, and the wound-up DLM lets the car surge
+	// each time the load switches off. Only integrate a shortfall while the
+	// car is drawing what the model predicts for the current DLM.
+	predictedCarA := float64(in.CurrentDLMA)*(1-t.ModelReserveFraction) -
+		m.worstHouseholdAvgA
+	carHeldBelowModel := maxCarA < predictedCarA-modelCarFollowBandA
+
+	if dt > 0 &&
+		!(errorA > 0 && (pinnedHigh || carHeldBelowModel)) &&
+		!(errorA < 0 && pinnedLow) {
 		m.integralA += t.ModelKp * errorA * dt / float64(t.ModelIntegralSeconds)
 		m.integralA = math.Max(-modelIntegralLimitA,
 			math.Min(modelIntegralLimitA, m.integralA))
