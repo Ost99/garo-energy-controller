@@ -46,10 +46,10 @@ func TestDecodeGaroSW2MaxPilotAAllCodes(t *testing.T) {
 func TestCapabilityDiscoveryFromObservedFirmwareEndpoints(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"serialNumber":771285,"factoryCurrentLimit":32,"switchCurrentLimit":32,"mainCharger":{"serialNumber":771285,"dipSwitchSettings":7929}}`)
+		fmt.Fprint(w, `{"serialNumber":100001,"factoryCurrentLimit":32,"switchCurrentLimit":32,"mainCharger":{"serialNumber":100001,"dipSwitchSettings":7929}}`)
 	})
 	mux.HandleFunc("/slaves/false", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `[{"serialNumber":771240,"dipSwitchSettings":7913},{"serialNumber":771285,"dipSwitchSettings":7929}]`)
+		fmt.Fprint(w, `[{"serialNumber":100002,"dipSwitchSettings":7913},{"serialNumber":100001,"dipSwitchSettings":7929}]`)
 	})
 
 	server := httptest.NewServer(mux)
@@ -60,10 +60,10 @@ func TestCapabilityDiscoveryFromObservedFirmwareEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetCapabilities() error = %v", err)
 	}
-	if got := caps.MaxPilotA(771285); got != 32 {
+	if got := caps.MaxPilotA(100001); got != 32 {
 		t.Fatalf("master max pilot = %d A, want 32 A", got)
 	}
-	if got := caps.MaxPilotA(771240); got != 32 {
+	if got := caps.MaxPilotA(100002); got != 32 {
 		t.Fatalf("slave max pilot = %d A, want 32 A", got)
 	}
 }
@@ -78,14 +78,14 @@ func TestCapabilityDiscoveryRetriesAfterTransientFailure(t *testing.T) {
 			http.Error(w, "starting", http.StatusServiceUnavailable)
 			return
 		}
-		fmt.Fprint(w, `{"serialNumber":771285,"factoryCurrentLimit":32,"switchCurrentLimit":32,"mainCharger":{"serialNumber":771285,"dipSwitchSettings":7929}}`)
+		fmt.Fprint(w, `{"serialNumber":100001,"factoryCurrentLimit":32,"switchCurrentLimit":32,"mainCharger":{"serialNumber":100001,"dipSwitchSettings":7929}}`)
 	})
 	mux.HandleFunc("/slaves/false", func(w http.ResponseWriter, r *http.Request) {
 		if fail.Load() {
 			http.Error(w, "starting", http.StatusServiceUnavailable)
 			return
 		}
-		fmt.Fprint(w, `[{"serialNumber":771240,"dipSwitchSettings":7913},{"serialNumber":771285,"dipSwitchSettings":7929}]`)
+		fmt.Fprint(w, `[{"serialNumber":100002,"dipSwitchSettings":7913},{"serialNumber":100001,"dipSwitchSettings":7929}]`)
 	})
 
 	server := httptest.NewServer(mux)
@@ -109,7 +109,7 @@ func TestCapabilityDiscoveryRetriesAfterTransientFailure(t *testing.T) {
 	if !client.capabilitiesLoaded {
 		t.Fatal("successful retry did not mark capabilities loaded")
 	}
-	if got := caps.MaxPilotA(771240); got != 32 {
+	if got := caps.MaxPilotA(100002); got != 32 {
 		t.Fatalf("slave max pilot after retry = %d A, want 32 A", got)
 	}
 }
@@ -118,7 +118,7 @@ func TestSetLoadBalancingFuseTransientWriteOmitsSlaves(t *testing.T) {
 	var posted map[string]json.RawMessage
 	mux := http.NewServeMux()
 	mux.HandleFunc("/lbconfig/false", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"loadBalancingFuse":14,"loadBalancingFuse101":32,"masterPhase":4,"slaves":[{"serialNumber":771240},{"serialNumber":771285}]}`)
+		fmt.Fprint(w, `{"loadBalancingFuse":14,"loadBalancingFuse101":32,"masterPhase":4,"slaves":[{"serialNumber":100002},{"serialNumber":100001}]}`)
 	})
 	mux.HandleFunc("/lbconfig", func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
@@ -152,7 +152,7 @@ func TestSetLoadBalancingFuse101SafeWriteOmitsSlaves(t *testing.T) {
 	var posted map[string]json.RawMessage
 	mux := http.NewServeMux()
 	mux.HandleFunc("/lbconfig/false", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"loadBalancingFuse":14,"loadBalancingFuse101":0,"masterPhase":4,"slaves":[{"serialNumber":771240,"loadBalanced":true},{"serialNumber":771285,"loadBalanced":false}]}`)
+		fmt.Fprint(w, `{"loadBalancingFuse":14,"loadBalancingFuse101":0,"masterPhase":4,"slaves":[{"serialNumber":100002,"loadBalanced":true},{"serialNumber":100001,"loadBalanced":false}]}`)
 	})
 	mux.HandleFunc("/lbconfig", func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
@@ -185,10 +185,10 @@ func TestSetLoadBalancingFuse101SafeWriteOmitsSlaves(t *testing.T) {
 func TestGetFastInfoCapturesLoadBalancedState(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"serialNumber":771285,"mode":"ALWAYS_ON","pilotLevel":32,"connector":"CHARGING_FINISHED","factoryCurrentLimit":32,"switchCurrentLimit":32,"mainCharger":{"serialNumber":771285,"dipSwitchSettings":7929}}`)
+		fmt.Fprint(w, `{"serialNumber":100001,"mode":"ALWAYS_ON","pilotLevel":32,"connector":"CHARGING_FINISHED","factoryCurrentLimit":32,"switchCurrentLimit":32,"mainCharger":{"serialNumber":100001,"dipSwitchSettings":7929}}`)
 	})
 	mux.HandleFunc("/slaves/false", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `[{"serialNumber":771240,"pilotLevel":6,"connector":"INITIALIZATION","loadBalanced":true,"dipSwitchSettings":7913},{"serialNumber":771285,"pilotLevel":32,"connector":"CHARGING_FINISHED","loadBalanced":false,"dipSwitchSettings":7929}]`)
+		fmt.Fprint(w, `[{"serialNumber":100002,"pilotLevel":6,"connector":"INITIALIZATION","loadBalanced":true,"dipSwitchSettings":7913},{"serialNumber":100001,"pilotLevel":32,"connector":"CHARGING_FINISHED","loadBalanced":false,"dipSwitchSettings":7929}]`)
 	})
 
 	server := httptest.NewServer(mux)
@@ -207,11 +207,11 @@ func TestGetFastInfoCapturesLoadBalancedState(t *testing.T) {
 	for _, state := range info.PilotLevels {
 		states[state.SerialNumber] = state
 	}
-	if !states[771240].LoadBalancedKnown || !states[771240].LoadBalanced {
-		t.Fatalf("771240 load-balanced state = %+v, want known/true", states[771240])
+	if !states[100002].LoadBalancedKnown || !states[100002].LoadBalanced {
+		t.Fatalf("100002 load-balanced state = %+v, want known/true", states[100002])
 	}
-	if !states[771285].LoadBalancedKnown || states[771285].LoadBalanced {
-		t.Fatalf("771285 load-balanced state = %+v, want known/false", states[771285])
+	if !states[100001].LoadBalancedKnown || states[100001].LoadBalanced {
+		t.Fatalf("100001 load-balanced state = %+v, want known/false", states[100001])
 	}
 }
 
@@ -219,7 +219,7 @@ func TestSetLoadBalancingFuse101NoOpDoesNotPost(t *testing.T) {
 	var posts atomic.Int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("/lbconfig/false", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"loadBalancingFuse":14,"loadBalancingFuse101":32,"slaves":[{"serialNumber":771240},{"serialNumber":771285}]}`)
+		fmt.Fprint(w, `{"loadBalancingFuse":14,"loadBalancingFuse101":32,"slaves":[{"serialNumber":100002},{"serialNumber":100001}]}`)
 	})
 	mux.HandleFunc("/lbconfig", func(w http.ResponseWriter, r *http.Request) {
 		posts.Add(1)

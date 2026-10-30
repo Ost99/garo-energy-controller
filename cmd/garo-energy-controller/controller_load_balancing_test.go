@@ -7,8 +7,8 @@ import (
 
 func TestChargerLoadBalancingDiagnosticsAllBalanced(t *testing.T) {
 	valid, all, errText := chargerLoadBalancingDiagnostics([]GaroPilotLevel{
-		{SerialNumber: 771285, LoadBalanced: true, LoadBalancedKnown: true},
-		{SerialNumber: 771240, LoadBalanced: true, LoadBalancedKnown: true},
+		{SerialNumber: 100001, LoadBalanced: true, LoadBalancedKnown: true},
+		{SerialNumber: 100002, LoadBalanced: true, LoadBalancedKnown: true},
 	}, true, false)
 	if !valid || !all || errText != "" {
 		t.Fatalf("got valid=%v all=%v error=%q", valid, all, errText)
@@ -17,21 +17,21 @@ func TestChargerLoadBalancingDiagnosticsAllBalanced(t *testing.T) {
 
 func TestChargerLoadBalancingDiagnosticsDetectsDisabledMaster(t *testing.T) {
 	valid, all, errText := chargerLoadBalancingDiagnostics([]GaroPilotLevel{
-		{SerialNumber: 771285, LoadBalanced: false, LoadBalancedKnown: true},
-		{SerialNumber: 771240, LoadBalanced: true, LoadBalancedKnown: true},
+		{SerialNumber: 100001, LoadBalanced: false, LoadBalancedKnown: true},
+		{SerialNumber: 100002, LoadBalanced: true, LoadBalancedKnown: true},
 	}, true, false)
 	if !valid || all {
 		t.Fatalf("got valid=%v all=%v, want valid=true all=false", valid, all)
 	}
-	if !strings.Contains(errText, "771285") || !strings.Contains(errText, "not load balanced") {
+	if !strings.Contains(errText, "100001") || !strings.Contains(errText, "not load balanced") {
 		t.Fatalf("unexpected error %q", errText)
 	}
 }
 
 func TestChargerLoadBalancingDiagnosticsUnknownIsNotFalse(t *testing.T) {
 	valid, all, errText := chargerLoadBalancingDiagnostics([]GaroPilotLevel{
-		{SerialNumber: 771285, LoadBalancedKnown: false},
-		{SerialNumber: 771240, LoadBalanced: true, LoadBalancedKnown: true},
+		{SerialNumber: 100001, LoadBalancedKnown: false},
+		{SerialNumber: 100002, LoadBalanced: true, LoadBalancedKnown: true},
 	}, true, false)
 	if valid || all || errText != "" {
 		t.Fatalf("got valid=%v all=%v error=%q, want unknown without false config error", valid, all, errText)

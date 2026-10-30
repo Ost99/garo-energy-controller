@@ -74,7 +74,7 @@ func (f *fakeGaro) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Fprintf(w, `{"loadBalancingFuse":%d,"loadBalancingPower":0,"loadBalancingFuse101":%d,`+
 			`"loadBalancingPower101":0,"masterPhase":16,"masterLoadBalanced":true,`+
-			`"slaves":[{"serialNumber":771240},{"serialNumber":771285}]}`,
+			`"slaves":[{"serialNumber":100002},{"serialNumber":100001}]}`,
 			f.fuse100, f.fuse101)
 
 	case r.Method == http.MethodPost && r.URL.Path == "/lbconfig":
@@ -98,12 +98,12 @@ func (f *fakeGaro) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case r.Method == http.MethodGet && r.URL.Path == "/status":
-		fmt.Fprint(w, `{"serialNumber":771285,"factoryCurrentLimit":32,"switchCurrentLimit":32,`+
-			`"mainCharger":{"serialNumber":771285,"dipSwitchSettings":7929}}`)
+		fmt.Fprint(w, `{"serialNumber":100001,"factoryCurrentLimit":32,"switchCurrentLimit":32,`+
+			`"mainCharger":{"serialNumber":100001,"dipSwitchSettings":7929}}`)
 
 	case r.Method == http.MethodGet && r.URL.Path == "/slaves/false":
-		fmt.Fprint(w, `[{"serialNumber":771240,"dipSwitchSettings":7913},`+
-			`{"serialNumber":771285,"dipSwitchSettings":7929}]`)
+		fmt.Fprint(w, `[{"serialNumber":100002,"dipSwitchSettings":7913},`+
+			`{"serialNumber":100001,"dipSwitchSettings":7929}]`)
 
 	default:
 		f.otherPosts++
