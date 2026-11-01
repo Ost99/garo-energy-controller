@@ -35,6 +35,10 @@ const (
 	// boundary. The hourly limit itself is the safety margin.
 	hardStopOvershootToleranceKWh = 0.0
 
+	// hardStopVoltsPerPhase converts CENTRAL101 phase currents to car power
+	// for the hard stop's household estimate.
+	hardStopVoltsPerPhase = 230.0
+
 	// noIncreaseFinalSeconds: no upward DLM changes this close to the end of
 	// the hour. Increases this late spend the slack faster than the slow
 	// downward path can correct, and only feed the hard stop.
@@ -180,6 +184,7 @@ type ControllerSnapshot struct {
 	PacingCorrectionW     float64 `json:"pacing_correction_w"`
 	PacingTargetPowerW    float64 `json:"pacing_target_power_w"`
 	HardBudgetCeilingW    float64 `json:"hard_budget_ceiling_w"`
+	HouseholdAvgW         float64 `json:"household_avg_w,omitempty"`
 	EffectiveTargetPowerW float64 `json:"effective_target_power_w"`
 	AllowedAveragePowerW  float64 `json:"allowed_average_power_w"`
 	PowerHeadroomW        float64 `json:"power_headroom_w"`
@@ -250,6 +255,10 @@ type EnergyController struct {
 
 	// model is the state of the model-based DLM controller.
 	model dlmModel
+
+	// Household power average for the hard stop (all strategies).
+	householdAvgW  float64
+	householdAvgAt time.Time
 
 	// garoSettings applies the configured GARO settings (startup mode,
 	// CENTRAL101) once GARO is ready. See garo_settings.go.
@@ -721,6 +730,29 @@ func hardStopRequired(s ControllerSnapshot) bool {
 		return true
 	}
 
+	// The household cannot be stopped, the car can. Stop when what is left
+	// of the budget only just covers the household for the rest of the hour
+	// plus the car until the stop takes effect; after that the car stays off
+	// until the next hour.
+	carW := (s.Central101Phase1A + s.Central101Phase2A + s.Central101Phase3A) *
+		hardStopVoltsPerPhase
+	if carW > 0 {
+		rest := float64(s.SecondsRemaining)
+		lead := math.Min(hardStopLeadTime.Seconds(), rest)
+		// Averaged household power, so a single burst does not stop the car
+		// for the rest of the hour; the lead-time check below still catches
+		// a sustained new load.
+		householdW := s.HouseholdAvgW
+		if householdW <= 0 {
+			householdW = s.GridPowerW - carW
+		}
+		householdKW := math.Max(householdW, 0) / 1000.0
+		neededKWh := householdKW*rest/3600.0 + carW/1000.0*lead/3600.0
+		if neededKWh-s.RemainingEnergyKWh > hardStopOvershootToleranceKWh {
+			return true
+		}
+	}
+
 	powerKW := math.Max(s.GridPowerW, 0) / 1000.0
 	if powerKW <= 0 {
 		return false
@@ -1133,6 +1165,7 @@ func (c *EnergyController) tick() {
 	// The hourly hard stop is independent of GARO DLM/load-balancing mode.
 	// ALWAYS_OFF remains effective even when one charger is not participating
 	// in DLM, so evaluate this before suspending DLM regulation.
+	s.HouseholdAvgW = c.householdAverage(now, s)
 	if hardStopRequired(s) {
 		log.Printf(
 			"hard stop: hour energy %.3f kWh, remaining %.3f kWh, grid %.0f W, "+
@@ -1541,6 +1574,7 @@ func (c *EnergyController) modelDecision(
 		PilotA:           car.PilotA,
 		MaxPilotA:        car.MaxPilotA,
 		TargetW:          s.EffectiveTargetPowerW,
+		BudgetCeilingW:   s.HardBudgetCeilingW,
 		DLMA:             currentLimit,
 		SinceWrite:       adjustmentAge,
 		MinA:             cfg.MinimumCurrentA,
@@ -1594,4 +1628,21 @@ func modelSingleCar(s ControllerSnapshot) (GaroPilotLevel, [3]bool, string) {
 		return car, phases, "car phases not recognised (" + s.PhaseMode + ")"
 	}
 	return car, phases, ""
+}
+
+// householdAverage updates and returns an exponential average of household
+// power (grid minus car) for the hard stop's estimate of the rest of the hour.
+func (c *EnergyController) householdAverage(now time.Time, s ControllerSnapshot) float64 {
+	carW := (s.Central101Phase1A + s.Central101Phase2A + s.Central101Phase3A) *
+		hardStopVoltsPerPhase
+	householdW := math.Max(s.GridPowerW-carW, 0)
+	dt := now.Sub(c.householdAvgAt).Seconds()
+	if c.householdAvgAt.IsZero() || dt <= 0 || dt > modelResetGap.Seconds() {
+		c.householdAvgW = householdW
+	} else {
+		c.householdAvgW += (1 - math.Exp(-dt/modelHouseholdAverageSeconds)) *
+			(householdW - c.householdAvgW)
+	}
+	c.householdAvgAt = now
+	return c.householdAvgW
 }

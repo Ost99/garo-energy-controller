@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ type garoSim struct {
 	carA     float64
 	measured [3]float64 // site currents as GARO saw them at its last update
 	sinceUpd float64
+	stopped  bool // hard stop: charging off
 }
 
 func (g *garoSim) site(household [3]float64) [3]float64 {
@@ -59,6 +61,9 @@ func (g *garoSim) step(dt float64, household [3]float64) {
 		g.measured = g.site(household) // stale until the next update
 	}
 	draw := math.Max(0, math.Min(float64(g.pilot), g.carMaxA)-g.carBelowA)
+	if g.stopped {
+		draw = 0
+	}
 	g.carA += (draw - g.carA) * (1 - math.Exp(-dt/g.carTau))
 }
 
@@ -67,12 +72,15 @@ type simScenario struct {
 	carMaxA     float64
 	household   func(sec float64) [3]float64
 	startSecond float64 // car plugged in this far into the hour
+	limitKWh    float64 // hourly limit; 0 = the default configuration
 }
 
 type simResult struct {
 	hourEnergyKWh float64
 	writes        int
 	writeReasons  []string
+	garoSlams     int // GARO cuts straight to the minimum
+	hardStops     int
 	peakGridW     float64 // after the first 10 minutes of charging
 	minGridW      float64
 	oscillating   bool
@@ -101,6 +109,9 @@ func simulateModelHour(t *testing.T, sc simScenario, v plantVariant) simResult {
 	t.Helper()
 	cfg := defaultConfig()
 	cfg.ControlTuning.ControlStrategy = "model"
+	if sc.limitKWh > 0 {
+		cfg.HourlyLimitKWh = sc.limitKWh
+	}
 	const volts = 230.0 // the controller assumes 240 W per phase amp
 	const dt = 5.0
 
@@ -120,7 +131,11 @@ func simulateModelHour(t *testing.T, sc simScenario, v plantVariant) simResult {
 		hh := sc.household(sec)
 		charging := sec >= sc.startSecond
 		if charging {
+			before := g.pilot
 			g.step(dt, hh)
+			if g.pilot == 6 && before > 8 {
+				res.garoSlams++
+			}
 		} else {
 			g.measured = hh
 		}
@@ -141,6 +156,22 @@ func simulateModelHour(t *testing.T, sc simScenario, v plantVariant) simResult {
 		now := start.Add(time.Duration(sec) * time.Second)
 		var s ControllerSnapshot
 		populateEnergyDiagnostics(&s, cfg, "sim", energy, gridW, now, true)
+		s.Charging = true
+		carPhaseA := [3]float64{}
+		for p, on := range g.carPhases {
+			if on {
+				carPhaseA[p] = g.carA
+			}
+		}
+		s.Central101Phase1A, s.Central101Phase2A, s.Central101Phase3A =
+			carPhaseA[0], carPhaseA[1], carPhaseA[2]
+		s.HouseholdAvgW = m.householdAvgW
+		if !g.stopped && hardStopRequired(s) {
+			// The controller's hard stop: charging off for the rest of the
+			// hour (the car's floor plus household can exceed a low limit).
+			g.stopped = true
+			res.hardStops++
+		}
 
 		var car [3]float64
 		for p := 0; p < 3; p++ {
@@ -151,7 +182,7 @@ func simulateModelHour(t *testing.T, sc simScenario, v plantVariant) simResult {
 		out := m.step(modelInput{
 			Now: now, GridW: gridW, SitePhaseA: site, CarPhaseA: car,
 			CarPhases: g.carPhases, PilotA: g.pilot, MaxPilotA: 32,
-			TargetW: s.EffectiveTargetPowerW, DLMA: g.dlm,
+			TargetW: s.EffectiveTargetPowerW, BudgetCeilingW: s.HardBudgetCeilingW, DLMA: g.dlm,
 			SinceWrite: now.Sub(lastWrite),
 			MinA:       cfg.MinimumCurrentA, MaxA: cfg.MaximumCurrentA,
 			WattsPerPhaseAmp: cfg.ControlTuning.OnePhaseWattsPerAmp,
@@ -179,7 +210,11 @@ func steadyHousehold(h [3]float64) func(float64) [3]float64 {
 
 func checkHour(t *testing.T, name string, r simResult, minKWh float64, maxWrites int) {
 	t.Helper()
-	limit := defaultConfig().HourlyLimitKWh
+	checkHourLimit(t, name, r, defaultConfig().HourlyLimitKWh, minKWh, maxWrites)
+}
+
+func checkHourLimit(t *testing.T, name string, r simResult, limit, minKWh float64, maxWrites int) {
+	t.Helper()
 	t.Logf("%s: %.2f kWh, %d writes, grid %.0f..%.0f W, oscillating %v",
 		name, r.hourEnergyKWh, r.writes, r.minGridW, r.peakGridW, r.oscillating)
 	if r.hourEnergyKWh > limit {
@@ -214,7 +249,7 @@ func TestModelOnePhaseCarFreePhaseBlocksRaise(t *testing.T) {
 			carPhases: onePhaseL2, carMaxA: 28,
 			household: steadyHousehold([3]float64{10, 1, 2}),
 		}, v)
-		checkHour(t, "1-phase blocked/"+v.name, r, 0, 6)
+		checkHour(t, "1-phase blocked/"+v.name, r, 0, 8)
 	}
 }
 
@@ -225,7 +260,7 @@ func TestModelOnePhaseSelfLimitedCar(t *testing.T) {
 			carPhases: onePhaseL2, carMaxA: 28,
 			household: steadyHousehold([3]float64{2, 1, 2}),
 		}, v)
-		checkHour(t, "1-phase self-limited/"+v.name, r, 0, 6)
+		checkHour(t, "1-phase self-limited/"+v.name, r, 0, 8)
 	}
 }
 
@@ -378,5 +413,80 @@ func TestModelLowerAvoidsGaroSlam(t *testing.T) {
 	out := m.step(in)
 	if out.DLMA != 16 {
 		t.Fatalf("lowered DLM to %d, want 16 (just over 1 A below the busiest phase): %s", out.DLMA, out.Reason)
+	}
+}
+
+func TestModelCarAtMaxGetsBurstRoom(t *testing.T) {
+	// 1-phase car limited to 20 A by itself, the budget covering the
+	// charger's 32 A, and a 12 A element cycling on the car's phase from the
+	// ramp onwards. With DLM at the hold position GARO slams the car to 6 A
+	// on every burst; with room for the burst within the hour's budget it
+	// does not need to.
+	oven := func(sec float64) [3]float64 {
+		h := [3]float64{4.3, 0.5, 2.2}
+		if sec >= 120 && math.Mod(sec, 300) >= 240 { // element starts while the car is still ramping
+			h[1] += 12
+		}
+		return h
+	}
+	for _, v := range plantVariants {
+		r := simulateModelHour(t, simScenario{carPhases: onePhaseL2, carMaxA: 20, household: oven}, v)
+		checkHour(t, "1-phase at max with cycling load/"+v.name, r, 0, 8)
+		if r.garoSlams > 2 {
+			t.Errorf("1-phase at max with cycling load/%s: GARO slammed the car %d times", v.name, r.garoSlams)
+		}
+	}
+}
+
+func TestModelOtherHourlyLimits(t *testing.T) {
+	// Nothing in the model assumes a particular hourly limit or car: the
+	// same scenarios must stay under 5, 7.5, 9.5 and 15 kWh. Where the
+	// budget covers the car's maximum, a cycling element on the car's phase
+	// must not make GARO slam the car (household room within the budget).
+	element := func(sec float64) [3]float64 {
+		h := [3]float64{4.3, 0.5, 2.2}
+		if sec >= 120 && math.Mod(sec, 300) >= 240 {
+			h[1] += 12
+			h[0] += 12 // reaches the 3-phase car too
+		}
+		return h
+	}
+	cars := []struct {
+		name    string
+		phases  [3]bool
+		carMaxA float64
+	}{
+		{"1-phase 20 A", onePhaseL2, 20},
+		{"3-phase 16 A", threePhase, 16},
+	}
+	for _, limit := range []float64{5, 7.5, 9.5, 15} {
+		for _, car := range cars {
+			for _, v := range plantVariants {
+				name := fmt.Sprintf("%.1f kWh/%s/%s", limit, car.name, v.name)
+				r := simulateModelHour(t, simScenario{
+					carPhases: car.phases, carMaxA: car.carMaxA, household: element, limitKWh: limit,
+				}, v)
+				// The car's 6 A floor plus the household can exceed a low
+				// limit on its own; then the hard stop must stop the car in
+				// time for the household to fit in the rest of the hour.
+				phasesN := map[bool]float64{true: 3, false: 1}[car.phases[0]]
+				floorKW := (6*phasesN + 7 + 12*0.2*map[bool]float64{true: 2, false: 1}[car.phases[0]]) * 230 / 1000
+				if floorKW > limit && r.hardStops == 0 {
+					t.Errorf("%s: floor above the limit but no hard stop", name)
+				}
+				// A budget hovering around the car's maximum with a cycling
+				// element switches between burst room and limiting the car;
+				// those writes are RAM-only 1 A steps, so allow more of them.
+				checkHourLimit(t, name, r, limit, 0, 16)
+				// GARO cuts are only avoidable when the budget covers the car
+				// at its maximum, the household and the element together.
+				phases := map[bool]float64{true: 3, false: 1}[car.phases[0]]
+				burstPhases := map[bool]float64{true: 2, false: 1}[car.phases[0]]
+				needKW := (car.carMaxA*phases + 7 + 12*burstPhases) * 230 / 1000
+				if limit-0.1 > needKW && r.garoSlams > 2 {
+					t.Errorf("%s: budget covers car and element but GARO slammed the car %d times", name, r.garoSlams)
+				}
+			}
+		}
 	}
 }

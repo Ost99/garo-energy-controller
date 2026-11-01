@@ -138,3 +138,23 @@ func TestHardStopNotRequiredOutsideLeadTime(t *testing.T) {
 		t.Fatal("hard stop issued outside the lead time")
 	}
 }
+
+func TestHardStopWhenHouseholdUsesTheRestOfTheBudget(t *testing.T) {
+	// 5 kWh limit, 25 min left, 1.2 kWh left: the car's 6 A floor (4.1 kW)
+	// plus 2.7 kW of household would breach long before the lead time, and
+	// the household alone needs 1.1 kWh of what is left. Stop now.
+	s := ControllerSnapshot{
+		Charging: true, EnergyValid: true,
+		RemainingEnergyKWh: 1.2, GridPowerW: 6840, SecondsRemaining: 1500,
+		Central101Phase1A: 6, Central101Phase2A: 6, Central101Phase3A: 6,
+	}
+	if !hardStopRequired(s) {
+		t.Fatal("hard stop not issued although the household alone uses the rest of the budget")
+	}
+	// Same hour with 1.6 kWh left: household 1.1 kWh + car until the stop
+	// takes effect 0.2 kWh still fits; keep charging.
+	s.RemainingEnergyKWh = 1.6
+	if hardStopRequired(s) {
+		t.Fatal("hard stop issued although household and the car's stop latency fit")
+	}
+}

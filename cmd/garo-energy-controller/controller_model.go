@@ -69,6 +69,14 @@ const (
 	// modelOscillationWindow counts as a cycling household load.
 	modelHouseholdSwingA = 5.0
 
+	// modelMinBurstRoomA: household room needed before DLM is used as
+	// burst room rather than as the car's limit.
+	modelMinBurstRoomA = 3.0
+
+	// modelBurstRoomStepA: change the household room only when it moves by
+	// at least this much.
+	modelBurstRoomStepA = 3
+
 	// modelHoldDownTicks: ticks (30 s each) DLM must stay well above the hold
 	// position before it is moved down.
 	modelHoldDownTicks = 3
@@ -94,16 +102,20 @@ const (
 )
 
 type dlmModel struct {
-	initialised    bool
-	last           time.Time
-	householdAvgW  float64
-	lastPilotA     int
-	lastLower      time.Time // last model write that lowered DLM to make GARO cut
-	pilotAtLower   int
-	garoCuts       []time.Time
-	recentPilots   []timedPilot
-	householdHist  []timedValue // highest household current on any phase
-	raiseRoomTicks int          // consecutive ticks with DLM well above the hold position
+	initialised     bool
+	last            time.Time
+	householdAvgW   float64
+	lastPilotA      int
+	lastLower       time.Time // last model write that lowered DLM to make GARO cut
+	pilotAtLower    int
+	garoCuts        []time.Time
+	recentPilots    []timedPilot
+	householdHist   []timedValue // highest household current on any phase
+	raiseRoomTicks  int          // consecutive ticks with DLM well above the hold position
+	belowPilotTicks int
+	lastCarA        float64
+	carMaxLearnedA  float64 // highest current this car session can take; 0 = unknown
+	roomMode        bool    // DLM used as household burst room within the budget
 }
 
 type timedPilot struct {
@@ -131,9 +143,12 @@ type modelInput struct {
 	PilotA    int
 	MaxPilotA int // 0 = unknown
 
-	TargetW    float64 // EffectiveTargetPowerW
-	DLMA       int
-	SinceWrite time.Duration
+	TargetW float64 // EffectiveTargetPowerW
+	// BudgetCeilingW: highest average power for the rest of the hour that
+	// keeps the hour under the limit (HardBudgetCeilingW).
+	BudgetCeilingW float64
+	DLMA           int
+	SinceWrite     time.Duration
 
 	MinA int
 	MaxA int
@@ -236,6 +251,22 @@ func (m *dlmModel) step(in modelInput) modelOutput {
 		}
 	}
 	m.householdHist = keptHousehold
+
+	// Learn the car's own maximum: the pilot cap, or a car that keeps
+	// drawing the same current well below its pilot.
+	if in.MaxPilotA > 0 && in.PilotA >= in.MaxPilotA && carMaxA >= float64(in.PilotA)-modelCarFollowA {
+		m.carMaxLearnedA = math.Max(m.carMaxLearnedA, float64(in.MaxPilotA))
+	}
+	// "Keeps drawing" = car current flat while the pilot stays above it.
+	if carMaxA < float64(in.PilotA)-modelCarFollowA && math.Abs(carMaxA-m.lastCarA) < 0.5 {
+		m.belowPilotTicks++
+		if m.belowPilotTicks >= 2 {
+			m.carMaxLearnedA = math.Max(m.carMaxLearnedA, carMaxA)
+		}
+	} else {
+		m.belowPilotTicks = 0
+	}
+	m.lastCarA = carMaxA
 	if maxHouseholdA-minHouseholdA >= modelHouseholdSwingA {
 		oscillating = true
 	}
@@ -295,6 +326,43 @@ func (m *dlmModel) step(in modelInput) modelOutput {
 	if in.SinceWrite < settle {
 		return hold(fmt.Sprintf("settling after DLM change (%ds/%ds)",
 			int(in.SinceWrite.Seconds()), int(settle.Seconds())))
+	}
+
+	// Budget at least as large as what the car can take: the car's learned
+	// maximum, or the charger's pilot cap while that is still unknown (so it
+	// applies from the start of the ramp). DLM then no longer has to limit
+	// the car; it only decides how much household load GARO tolerates before
+	// cutting it. Give household bursts as much room as the hour's budget
+	// can absorb without breaching the limit, assuming the car at that
+	// maximum, up to the main-fuse setting. Works during cycling loads too:
+	// that is where the room avoids GARO's cuts.
+	carCapA := m.carMaxLearnedA
+	if carCapA == 0 {
+		carCapA = maxPilot
+	}
+	slackW := in.BudgetCeilingW -
+		(m.householdAvgW + float64(nPhases)*carCapA*in.WattsPerPhaseAmp)
+	roomA := math.Max(0, slackW/in.WattsPerPhaseAmp)
+	// Enter with a useful amount of room and leave when it is nearly gone,
+	// so a budget that hovers around the car's maximum does not switch the
+	// regime back and forth.
+	switch {
+	case want < carCapA-modelStepDeadbandA || roomA < modelMinBurstRoomA/3:
+		m.roomMode = false
+	case want >= carCapA && roomA >= modelMinBurstRoomA:
+		m.roomMode = true
+	}
+	if m.roomMode {
+		base := minHouseholdA + carCapA
+		target := min(in.MaxA, int(math.Ceil(base+modelHoldRoomA+roomA)))
+		// Change the room only in steps, since the budget estimate moves
+		// with every household change; the hard stop covers the rest.
+		if target >= in.DLMA+modelBurstRoomStepA || target <= in.DLMA-modelBurstRoomStepA {
+			return write(target, fmt.Sprintf(
+				"budget covers the car at %.0f A: room for %.0f A of household load within the hour's budget",
+				carCapA, roomA))
+		}
+		return hold(fmt.Sprintf("budget covers the car at %.0f A; household room set", carCapA))
 	}
 
 	switch {
