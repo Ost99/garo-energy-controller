@@ -12,7 +12,7 @@ import (
 // self-consistency.
 type garoSim struct {
 	raiseRoomA    float64 // raise when every phase has this much room
-	cutOverA      float64 // cut when a phase is this far over DLM
+	cutOverA      float64 // cut 1 A when a phase is this far over DLM, to 6 A when 1 A further
 	stepUpA       int     // pilot step per raise
 	updateSeconds float64 // GARO update interval; it acts on the previous update's reading
 
@@ -49,8 +49,8 @@ func (g *garoSim) step(dt float64, household [3]float64) {
 			room = math.Min(room, float64(g.dlm)-g.measured[p])
 		}
 		switch {
-		case over >= g.cutOverA && over > 4:
-			g.pilot = 6
+		case over >= g.cutOverA+1:
+			g.pilot = 6 // about 2 A over: straight to the minimum
 		case over >= g.cutOverA:
 			g.pilot = max(6, g.pilot-1)
 		case room >= g.raiseRoomA:
@@ -314,5 +314,69 @@ func TestModelRaiseBlockedByCarFreePhase(t *testing.T) {
 	out := m.step(in)
 	if out.DLMA != in.DLMA {
 		t.Fatalf("raised DLM to %d although GARO would overshoot: %s", out.DLMA, out.Reason)
+	}
+}
+
+func TestModelShortHouseholdDipDoesNotMoveDLMDown(t *testing.T) {
+	// Seen 2026-10-30: a microwave paused for ~30 s, the model moved DLM
+	// 23 -> 18 during the pause, and GARO cut the car to 6 A when the
+	// microwave came back. A dip must last several ticks before DLM moves.
+	var m dlmModel
+	now := time.Date(2026, 10, 30, 23, 28, 0, 0, time.Local)
+	base := modelInput{
+		GridW: 9600, CarPhaseA: [3]float64{9, 9, 9}, CarPhases: threePhase,
+		PilotA: 9, MaxPilotA: 32, TargetW: 9500, DLMA: 23, SinceWrite: time.Hour,
+		MinA: 6, MaxA: 50, WattsPerPhaseAmp: 240,
+	}
+	step := func(sec int, l1 float64) modelOutput {
+		in := base
+		in.Now = now.Add(time.Duration(sec) * time.Second)
+		in.SitePhaseA = [3]float64{l1, 9.6, 10.8}
+		return m.step(in)
+	}
+	step(0, 19.6)                              // microwave on
+	if out := step(30, 15.3); out.DLMA != 23 { // 30 s pause
+		t.Fatalf("DLM moved to %d on a 30 s dip: %s", out.DLMA, out.Reason)
+	}
+	step(60, 19.6) // back on
+	for sec := 90; sec <= 150; sec += 30 {
+		if out := step(sec, 15.3); out.DLMA != 23 && sec < 150 {
+			t.Fatalf("DLM moved to %d after %d s of a sustained dip", out.DLMA, sec-90)
+		} else if sec == 150 && out.DLMA == 23 {
+			t.Fatalf("DLM not moved down after a sustained dip: %s", out.Reason)
+		}
+	}
+}
+
+func TestModelLoadWithShortPauses(t *testing.T) {
+	// Seen 2026-10-30: a 10 A load on the car's phase, on for ~4.5 minutes
+	// and off for ~30 s. The pauses must not make the model move DLM around.
+	pauses := func(sec float64) [3]float64 {
+		h := [3]float64{4.5, 1, 2}
+		if math.Mod(sec, 300) < 270 {
+			h[0] += 10
+		}
+		return h
+	}
+	for _, v := range plantVariants {
+		r := simulateModelHour(t, simScenario{carPhases: threePhase, carMaxA: 16, household: pauses}, v)
+		checkHour(t, "3-phase load with short pauses/"+v.name, r, 0, 8)
+	}
+}
+
+func TestModelLowerAvoidsGaroSlam(t *testing.T) {
+	// Seen 2026-10-30: busiest phase 16.9 A, DLM 19 -> 15 put it ~2 A over
+	// and GARO cut the car 12 -> 6. The first lowering step must aim for
+	// just over 1 A.
+	var m dlmModel
+	in := modelInput{
+		Now: time.Date(2026, 10, 30, 23, 34, 43, 0, time.Local), GridW: 10520,
+		SitePhaseA: [3]float64{16.9, 12.5, 14.1}, CarPhaseA: [3]float64{12.1, 12, 12},
+		CarPhases: threePhase, PilotA: 12, MaxPilotA: 32, TargetW: 9300,
+		DLMA: 19, SinceWrite: time.Hour, MinA: 6, MaxA: 50, WattsPerPhaseAmp: 240,
+	}
+	out := m.step(in)
+	if out.DLMA != 16 {
+		t.Fatalf("lowered DLM to %d, want 16 (just over 1 A below the busiest phase): %s", out.DLMA, out.Reason)
 	}
 }

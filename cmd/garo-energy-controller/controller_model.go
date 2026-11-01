@@ -58,8 +58,20 @@ const (
 	// modelOscillationWindow / modelOscillationCuts: this many GARO cuts
 	// (pilot drops without a model write) within the window count as a
 	// cycling household load.
-	modelOscillationWindow = 5 * time.Minute
+	modelOscillationWindow = 10 * time.Minute
 	modelOscillationCuts   = 2
+
+	// modelOscillationLowerDeadbandA: while a cycling load is recognised,
+	// lower only when the car is this far above the wanted level.
+	modelOscillationLowerDeadbandA = 3.0
+
+	// modelHouseholdSwingA: a household-current swing this large within
+	// modelOscillationWindow counts as a cycling household load.
+	modelHouseholdSwingA = 5.0
+
+	// modelHoldDownTicks: ticks (30 s each) DLM must stay well above the hold
+	// position before it is moved down.
+	modelHoldDownTicks = 3
 
 	// modelRecentPilotWindow: raises are judged against the highest pilot
 	// in this window.
@@ -82,19 +94,28 @@ const (
 )
 
 type dlmModel struct {
-	initialised   bool
-	last          time.Time
-	householdAvgW float64
-	lastPilotA    int
-	lastLower     time.Time // last model write that lowered DLM to make GARO cut
-	pilotAtLower  int
-	garoCuts      []time.Time
-	recentPilots  []timedPilot
+	initialised    bool
+	last           time.Time
+	householdAvgW  float64
+	lastPilotA     int
+	lastLower      time.Time // last model write that lowered DLM to make GARO cut
+	pilotAtLower   int
+	garoCuts       []time.Time
+	recentPilots   []timedPilot
+	householdHist  []timedValue // highest household current on any phase
+	raiseRoomTicks int          // consecutive ticks with DLM well above the hold position
 }
 
 type timedPilot struct {
-	at     time.Time
-	pilotA int
+	at          time.Time
+	pilotA      int
+	busiestA    float64
+	busiestCarA float64
+}
+
+type timedValue struct {
+	at    time.Time
+	value float64
 }
 
 func (m *dlmModel) reset() { *m = dlmModel{} }
@@ -136,7 +157,9 @@ func (m *dlmModel) step(in modelInput) modelOutput {
 	busiestA := 0.0
 	busiestCarA := 0.0
 	busiestFreeA := 0.0
+	householdMaxA := 0.0
 	for p := 0; p < 3; p++ {
+		householdMaxA = math.Max(householdMaxA, in.SitePhaseA[p]-in.CarPhaseA[p])
 		carW += in.CarPhaseA[p] * in.WattsPerPhaseAmp
 		busiestA = math.Max(busiestA, in.SitePhaseA[p])
 		if in.CarPhases[p] {
@@ -183,14 +206,38 @@ func (m *dlmModel) step(in modelInput) modelOutput {
 
 	// Highest recent pilot: a sample taken just after GARO cut the car for a
 	// household burst must not look like room to raise.
-	m.recentPilots = append(m.recentPilots, timedPilot{in.Now, in.PilotA})
+	// Lowest recent busiest-phase current: the baseline without household
+	// bursts, used when moving DLM up so a sample taken during a burst does
+	// not place DLM high above the baseline.
+	m.recentPilots = append(m.recentPilots,
+		timedPilot{in.Now, in.PilotA, busiestA, busiestCarA})
 	recentMaxPilot := in.PilotA
+	recentMinBusiestA := busiestA
+	recentMinBusiestCarA := busiestCarA
 	keptPilots := m.recentPilots[:0]
 	for _, rp := range m.recentPilots {
 		if in.Now.Sub(rp.at) <= modelRecentPilotWindow {
 			keptPilots = append(keptPilots, rp)
 			recentMaxPilot = max(recentMaxPilot, rp.pilotA)
+			recentMinBusiestA = math.Min(recentMinBusiestA, rp.busiestA)
+			recentMinBusiestCarA = math.Min(recentMinBusiestCarA, rp.busiestCarA)
 		}
+	}
+	// Household swings larger than GARO's band also mean a cycling load,
+	// even when the car is already at its floor and GARO has nothing to cut.
+	m.householdHist = append(m.householdHist, timedValue{in.Now, householdMaxA})
+	minHouseholdA, maxHouseholdA := householdMaxA, householdMaxA
+	keptHousehold := m.householdHist[:0]
+	for _, h := range m.householdHist {
+		if in.Now.Sub(h.at) <= modelOscillationWindow {
+			keptHousehold = append(keptHousehold, h)
+			minHouseholdA = math.Min(minHouseholdA, h.value)
+			maxHouseholdA = math.Max(maxHouseholdA, h.value)
+		}
+	}
+	m.householdHist = keptHousehold
+	if maxHouseholdA-minHouseholdA >= modelHouseholdSwingA {
+		oscillating = true
 	}
 	m.recentPilots = keptPilots
 
@@ -223,13 +270,27 @@ func (m *dlmModel) step(in modelInput) modelOutput {
 		return out
 	}
 
+	// DLM far enough above the hold position that GARO can raise. Counted
+	// over consecutive ticks so a short household dip (an appliance pausing
+	// for half a minute) does not move DLM down just before the load returns.
+	position := int(math.Ceil(busiestA + modelHoldRoomA))
+	if in.DLMA > position+1 && float64(in.DLMA)-busiestA >= garoRaiseRoomA {
+		m.raiseRoomTicks++
+	} else {
+		m.raiseRoomTicks = 0
+	}
+
 	pilot := float64(in.PilotA)
 	// A car that draws less than its pilot is limited by itself; lowering the
 	// pilot above what it draws changes nothing.
 	effectivePilot := math.Min(pilot, carMaxA+modelCarFollowA)
 	settle := modelSettle
+	lowerDeadbandA := modelStepDeadbandA
 	if oscillating {
+		// GARO raises in every pause of a cycling load and cuts again when
+		// it returns; a car briefly above the wanted level is part of that.
 		settle = modelOscillationSettle
+		lowerDeadbandA = modelOscillationLowerDeadbandA
 	}
 	if in.SinceWrite < settle {
 		return hold(fmt.Sprintf("settling after DLM change (%ds/%ds)",
@@ -247,10 +308,13 @@ func (m *dlmModel) step(in modelInput) modelOutput {
 		if carMaxA < pilot-modelCarFollowA {
 			return hold(fmt.Sprintf("car draws %.1f A below its %d A pilot", pilot-carMaxA, in.PilotA))
 		}
+		// Plan from the recent baseline, so a sample taken during a household
+		// burst does not place DLM high above it.
+		baseCarA := math.Min(busiestCarA, recentMinBusiestCarA)
 		riseA := math.Floor(want) - pilot
-		dlm := math.Max(busiestCarA+riseA+modelRaiseLandingRoomA, busiestFreeA+garoRaiseRoomA)
+		dlm := math.Max(baseCarA+riseA+modelRaiseLandingRoomA, busiestFreeA+garoRaiseRoomA)
 		target := int(math.Ceil(dlm))
-		if expected := float64(target) - modelRaiseLandingRoomA - busiestCarA; expected > riseA+1 {
+		if expected := float64(target) - modelRaiseLandingRoomA - baseCarA; expected > riseA+1 {
 			return hold(fmt.Sprintf(
 				"raise blocked: household on a phase without the car (%.1f A) would let GARO raise %.0f A instead of %.0f A",
 				busiestFreeA, expected, riseA))
@@ -260,32 +324,41 @@ func (m *dlmModel) step(in modelInput) modelOutput {
 		}
 		return write(target, fmt.Sprintf("raise pilot %d -> ~%.0f A", in.PilotA, math.Floor(want)))
 
-	case want <= effectivePilot-modelStepDeadbandA:
+	case want <= effectivePilot-lowerDeadbandA:
 		if in.PilotA <= in.MinA {
 			return hold("at the 6 A floor; the hard stop handles the rest")
 		}
-		// GARO cuts about 1 A per update once a phase is ~1 A over DLM. If
-		// the previous step did not trigger a cut, go one further.
-		dlm := min(int(math.Floor(busiestA))-1, in.DLMA-1)
+		// GARO cuts 1 A per update when a phase is about 1 A over DLM, but
+		// straight to 6 A when it is about 2 A over (seen: 16.9 A at DLM 15
+		// cut 12 -> 6). Aim for just over 1 A; if that did not trigger a
+		// cut, the next step goes one further.
+		dlm := min(int(math.Round(busiestA))-1, in.DLMA-1)
 		m.lastLower = in.Now
 		m.pilotAtLower = in.PilotA
 		return write(dlm,
 			fmt.Sprintf("lower pilot %d A by one step (wanted %.1f A)", in.PilotA, want))
 
+	case want >= pilot+modelStepDeadbandA:
+		return hold(fmt.Sprintf(
+			"holding after a recent GARO cut (pilot was %d A within %d min)",
+			recentMaxPilot, int(modelRecentPilotWindow.Minutes())))
+
 	default:
 		if oscillating {
 			return hold("GARO is cutting for a cycling household load; holding DLM")
 		}
-		position := int(math.Ceil(busiestA + modelHoldRoomA))
-		minRoom := float64(in.DLMA) - busiestA
 		switch {
 		case !m.lastLower.IsZero() && in.PilotA < m.pilotAtLower && in.DLMA < position-1:
 			// After a cut the model asked for, DLM sits at the cut edge;
 			// move it up so the next household increase does not trigger
 			// another. After a cut GARO made by itself, DLM is left alone.
 			m.lastLower = time.Time{}
-			return write(position, "move DLM up into the hold position (burst room)")
-		case in.DLMA > position+1 && minRoom >= garoRaiseRoomA:
+			if up := int(math.Ceil(recentMinBusiestA + modelHoldRoomA)); up > in.DLMA {
+				return write(up, "move DLM up into the hold position (burst room)")
+			}
+			return hold("on target")
+		case m.raiseRoomTicks >= modelHoldDownTicks:
+			m.raiseRoomTicks = 0
 			return write(position, "move DLM down to the hold position (stop an unwanted GARO raise)")
 		default:
 			return hold("on target")
