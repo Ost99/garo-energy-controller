@@ -1,10 +1,12 @@
 # garo-energy-controller — observations and TODO
 
-Status as of 2026-10-30. The incremental controller is the default. The model
-controller (`control_strategy: "model"`, v2.1, see `controller_model.go`) is
+Status as of 2026-10-31. The incremental controller is the default. The model
+controller (`control_strategy: "model"`, v2.2, see `controller_model.go`) is
 opt-in and regulates **one charging car** (1- or 3-phase); other
-configurations fall back to incremental for that tick. Tested on the real
-system with a 3-phase car; 1-phase car and two-car charging still to do.
+configurations fall back to incremental for that tick. v2.1 tested on the real
+system with a 3-phase car and with a 1-phase car; v2.2 (household room within
+the budget, household-aware hard stop) tested in simulation only. Two-car
+charging still to do.
 
 ## Goals and constraints
 
@@ -76,6 +78,8 @@ alone, both cars). `S_p` = CENTRAL100 current on phase p (household + cars).
 - A car plugged in but not charging reserves nothing.
 - Max pilot is decoded from `dipSwitchSettings` (SW2); CENTRAL101 acts as the
   chargers' sub-fuse.
+- Large cuts go to about the minimum: 6 A in most cases, once 8 A (a phase
+  ~14 A over DLM).
 - Household loads that switch by more than the band (~5 A) on a car's phase
   make GARO cut the car whatever DLM is: GARO raises whenever there is ~4 A of
   room, so room left for bursts fills up. Loads that switch by less than that
@@ -109,7 +113,8 @@ alone, both cars). `S_p` = CENTRAL100 current on phase p (household + cars).
 
 ### Cars
 
-- A 1-phase car tested draws ~0.5–1 A below its pilot and stops at ~28 A.
+- A 1-phase car tested draws ~0.5–2 A below its pilot (more while ramping)
+  and stops at ~28–29 A (29.2 A at pilot 31).
 - A 3-phase car tested follows its pilot within ~15 s; anomaly: 10.1 A at
   pilot 11 for over a minute (twice).
 
@@ -129,12 +134,19 @@ alone, both cars). `S_p` = CENTRAL100 current on phase p (household + cars).
 
 - `accumulatedConsumptionLastHour` resets correctly at the full hour.
 - Hour boundaries with steady load pass without DLM writes.
+- Hard stop (all strategies): stop when what is left of the budget only just
+  covers the household for the rest of the hour (averaged household power,
+  ~2 min, shown as `household_avg_w`) plus the car until the stop takes
+  effect (lead time 180 s, or the rest of the hour). The car stays off until
+  the next hour. The older check (limit reached within the lead time at the
+  current power) is kept as a safety net. Loads that switch on after the stop
+  can still push the hour over; nothing can stop household load.
 - Known behaviour: in automatic mode the controller starts by setting DLM to
   `safe_current_a`, so a restart while a car charges drops it to 6 A; the
   model raises again after ~2 minutes (it treats the drop as a recent GARO
   cut). Left as is: restarts are very rare outside testing.
 
-## Model controller v2.1 (implemented, single car)
+## Model controller v2.2 (implemented, single car)
 
 Energy first, then GARO's band. Power setpoint from hourly pacing
 (`EffectiveTargetPowerW`); wanted pilot = (setpoint − averaged household
@@ -157,14 +169,43 @@ error.
   household swing of 5 A or more within 10 minutes count as a cycling load:
   no raises, slower reductions (3 min), and a 3 A deadband for lowering.
 - **Deadband:** act only when the wanted pilot differs by 1.5 A or more.
+- **Household room within the budget (v2.2):** when the budget covers what
+  the car can take (its learned maximum, or the charger's pilot cap while that
+  is unknown, so from the start of the ramp), DLM no longer has to limit the
+  car. It is then set to household baseline + car maximum + 2.5 A + room,
+  where the room is what the hard budget ceiling (highest average power for
+  the rest of the hour that keeps it under the limit) leaves after the
+  average household and the car at its maximum, capped at
+  `maximum_current_a`. A household load using the full room for the rest of
+  the hour still keeps the hour under the limit. Hysteresis: entered with
+  ≥ 3 A of room and the budget at the car's maximum, left when the room
+  drops below 1 A or the budget falls 1.5 A below the car's maximum; the room
+  changes only in steps of ≥ 3 A. When the budget covers less than the car
+  can take, DLM must limit the car (GARO raises whenever there is ~4 A of
+  room) and the normal regulation applies.
 - **Scope:** exactly one charging charger (`chargeStatus: 64`), car phases
   recognised from CENTRAL101, rotation consistent with CENTRAL101; otherwise
   incremental for that tick, with the reason in the decision text.
 
-Results on the real system (3-phase car): long steady periods with 0 writes;
-hour boundaries without writes; 1–3 writes for large step loads; 0 writes
-during 10+ minutes of a cycling 2–4 kW heating element on a car phase (GARO
-still cut the car on each burst); hours ended under the limit.
+Results on the real system (v2.1):
+
+- 3-phase car: long steady periods with 0 writes; hour boundaries without
+  writes; 1–3 writes for large step loads; 0 writes during 10+ minutes of a
+  cycling 2–4 kW heating element on a car phase (GARO still cut the car on
+  each burst); hours ended under the limit.
+- 1-phase car: one write to start the ramp from idle, one to the hold
+  position; 0 writes during 20+ minutes of the cycling element on the car's
+  phase. GARO cut the car to 6–8 A on each burst (5–6 times), a ~4.8 kW swing
+  each time; v2.2's household room is meant to avoid these when the budget
+  allows.
+
+Simulation (v2.2), each scenario against five plant variants around the
+measured GARO behaviour, at hourly limits of 5, 7.5, 9.5 and 15 kWh with a
+1-phase and a 3-phase car and a cycling element from the start of the ramp:
+every hour under its limit; where the budget covers car and element, no GARO
+cuts. At low limits the car's 6 A floor plus household can exceed the limit;
+then only the hard stop helps (5 kWh with a 3-phase car ended at 4.0–4.4 kWh,
+so the stop is somewhat conservative).
 
 Lessons from the earlier model (v1, replaced):
 
@@ -176,11 +217,14 @@ Lessons from the earlier model (v1, replaced):
 - In mixed charging a single W/A factor mispredicts power.
 - Simulation tests must check swing size and write counts and use a plant
   model that differs from the controller's assumptions.
+- Neither the model nor the tests may assume one hourly limit or car: the
+  limit is configurable (other tariff steps, e.g. 5, 7.5 or 15 kWh, are just
+  as relevant), so tests run across several limits.
 
 | Configuration | c(L1,L2,L3) example | Status |
 |---|---|---|
-| One 3-phase | 1,1,1 | model v2.1, tested |
-| One 1-phase | 1,0,0 | model v2.1, simulation only — test next |
+| One 3-phase | 1,1,1 | model v2.1 tested; v2.2 simulation |
+| One 1-phase | 1,0,0 | model v2.1 tested; v2.2 simulation |
 | 1-phase + 3-phase | 2,1,1 | incremental; model extension next |
 | Two 1-phase, different L | 1,1,0 | incremental; needs a 1-phase cable |
 | Two 1-phase, same L | 2,0,0 | incremental; needs rewiring; simulation only |
@@ -188,8 +232,13 @@ Lessons from the earlier model (v1, replaced):
 
 ## TODO — measurements
 
-- [ ] Model v2.1 with the 1-phase car: steady state, hour boundary, cycling
-      heating element on the car's phase.
+- [x] Model v2.1 with the 1-phase car: ramp from idle, cycling heating
+      element on the car's phase.
+- [ ] Model v2.2 with the 1-phase car and the cycling element: expect
+      "budget covers the car", DLM well above the car, no GARO cuts.
+- [ ] New hard stop: set the hourly limit low for one hour (e.g. 5 kWh) with
+      the 3-phase car charging; expect an early stop, car off until the full
+      hour, hour under the limit in Tibber. Set the limit back afterwards.
 - [ ] Swap the cars between chargers (3-phase on slave, 1-phase on master):
       separates "master first" from "3-phase car first" when cutting, and
       "slave +2–3 A" from "1-phase car +2–3 A" when raising.
@@ -207,9 +256,19 @@ Lessons from the earlier model (v1, replaced):
       around the model's assumptions.
 - [x] Model v2.1 for one car, rotation/CENTRAL101 mismatch warning, fallback
       to incremental outside scope.
-- [ ] Model for two cars, starting with 1-phase + 3-phase: per-phase car
-      counts, GARO's split and order, 6 A floor per car on a shared phase,
-      cut order between chargers. Extend the simulator to two chargers first.
+- [x] v2.2: household room within the budget; household-aware hard stop;
+      simulation tests across hourly limits.
+- [ ] Simulator for two chargers: per-phase car counts, step sizes per
+      charger, history-dependent split, 6 A floor per car on a shared phase,
+      hard stop for both cars. Run both hypotheses as plant variants
+      ("master first" vs "3-phase car first" when cutting; "slave" vs
+      "1-phase car" +2–3 A when raising) until the swap test decides.
+- [ ] Model for two cars, starting with 1-phase + 3-phase: observe which
+      charger GARO actually moves rather than assume it.
+- [ ] Duty cycling (stop/start over the hour) for limits below the car's
+      floor plus household, where today only the hard stop helps.
+- [ ] Possibly: make the hard stop's household estimate less conservative
+      (it currently includes the average of household bursts).
 - [ ] Status page: show detected topology, binding phase and fallback reason
       outside the decision text.
 - [ ] Add `catch_up_fade_seconds` to the settings page (currently config/API
