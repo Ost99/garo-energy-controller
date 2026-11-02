@@ -77,6 +77,19 @@ const (
 	// at least this much.
 	modelBurstRoomStepA = 3
 
+	// modelStaircaseMinStep: shortest time between 1 A lowering steps.
+	modelStaircaseMinStep = 20 * time.Second
+
+	// modelStaircaseNoCut: a lowering step GARO has not acted on after this
+	// long did not trigger a cut (GARO reacts within 5–15 s).
+	modelStaircaseNoCut = 45 * time.Second
+
+	// modelCutLandAutoA / modelCutLandMinA: excess (A above the wanted level)
+	// from which "auto" and "cut" cut and land. Below ~5 A GARO's cut cannot
+	// land it: the phase would not be ~2 A over DLM.
+	modelCutLandAutoA = 7.0
+	modelCutLandMinA  = 5.0
+
 	// modelHoldDownTicks: ticks (30 s each) DLM must stay well above the hold
 	// position before it is moved down.
 	modelHoldDownTicks = 3
@@ -108,6 +121,8 @@ type dlmModel struct {
 	lastPilotA      int
 	lastLower       time.Time // last model write that lowered DLM to make GARO cut
 	pilotAtLower    int
+	lastOwnCut      time.Time // last model write meant to make GARO cut
+	lowerExtraA     int       // learned: extra amps below "1 A over" this GARO needs to cut
 	garoCuts        []time.Time
 	recentPilots    []timedPilot
 	householdHist   []timedValue // highest household current on any phase
@@ -147,8 +162,11 @@ type modelInput struct {
 	// BudgetCeilingW: highest average power for the rest of the hour that
 	// keeps the hour under the limit (HardBudgetCeilingW).
 	BudgetCeilingW float64
-	DLMA           int
-	SinceWrite     time.Duration
+
+	// Reduction: "auto", "staircase" or "cut" (ModelReduction).
+	Reduction  string
+	DLMA       int
+	SinceWrite time.Duration
 
 	MinA int
 	MaxA int
@@ -195,10 +213,15 @@ func (m *dlmModel) step(in modelInput) modelOutput {
 			alpha := 1 - math.Exp(-dt/modelHouseholdAverageSeconds)
 			m.householdAvgW += alpha * (householdW - m.householdAvgW)
 
-			// A pilot drop the model did not ask for is a GARO cut. The model
-			// lowers 1 A at a time, so a larger drop is GARO's own as well.
+			// A pilot drop the model did not ask for is a GARO cut. Drops
+			// shortly after a model lowering or cut and land are GARO's
+			// response to that write (including overcuts), not a household
+			// load.
 			drop := m.lastPilotA - in.PilotA
-			if drop >= 3 || (drop > 0 && in.Now.Sub(m.lastLower) > modelSettle) {
+			if drop >= 3 && !m.lastLower.IsZero() && in.Now.Sub(m.lastLower) <= modelSettle {
+				m.lowerExtraA = 0 // our 1 A step made GARO slam: no extra amp
+			}
+			if drop > 0 && in.Now.Sub(m.lastOwnCut) > modelSettle {
 				m.garoCuts = append(m.garoCuts, in.Now)
 			}
 		}
@@ -323,7 +346,16 @@ func (m *dlmModel) step(in modelInput) modelOutput {
 		settle = modelOscillationSettle
 		lowerDeadbandA = modelOscillationLowerDeadbandA
 	}
-	if in.SinceWrite < settle {
+	// Staircase: after a 1 A lowering step, continue as soon as GARO has cut
+	// and the car has followed (~30–40 s) instead of the full settle time.
+	// If GARO did not cut at all, the step was too small: go one further
+	// once GARO has had time to act.
+	lastWasLower := !m.lastLower.IsZero() &&
+		in.Now.Sub(m.lastLower) <= in.SinceWrite+time.Second
+	stepDone := lastWasLower && in.SinceWrite >= modelStaircaseMinStep &&
+		((in.PilotA < m.pilotAtLower && carMaxA >= pilot-modelCarFollowA) ||
+			(in.PilotA >= m.pilotAtLower && in.SinceWrite >= modelStaircaseNoCut))
+	if in.SinceWrite < settle && !stepDone {
 		return hold(fmt.Sprintf("settling after DLM change (%ds/%ds)",
 			int(in.SinceWrite.Seconds()), int(settle.Seconds())))
 	}
@@ -400,8 +432,44 @@ func (m *dlmModel) step(in modelInput) modelOutput {
 		// straight to 6 A when it is about 2 A over (seen: 16.9 A at DLM 15
 		// cut 12 -> 6). Aim for just over 1 A; if that did not trigger a
 		// cut, the next step goes one further.
-		dlm := min(int(math.Round(busiestA))-1, in.DLMA-1)
+		// Far above the wanted level: one write to the DLM at which GARO's
+		// ramp would stop at the wanted level. The phase is then ≥ 2 A over,
+		// so GARO cuts the car to 6 A and ramps it back up by itself.
+		excessA := effectivePilot - want
+		if excessA >= cutLandThresholdA(in.Reduction) {
+			householdCarA := 0.0
+			for p := 0; p < 3; p++ {
+				if in.CarPhases[p] {
+					householdCarA = math.Max(householdCarA, in.SitePhaseA[p]-in.CarPhaseA[p])
+				}
+			}
+			land := int(math.Ceil(householdCarA + math.Floor(want) + modelRaiseLandingRoomA))
+			if float64(land) <= math.Round(busiestA)-2 {
+				m.lastOwnCut = in.Now
+				m.lastLower = time.Time{}
+				return write(land, fmt.Sprintf(
+					"cut and land: pilot %d A is %.0f A above the wanted %.1f A",
+					in.PilotA, excessA, want))
+			}
+		}
+		// Just over 1 A below the busiest phase. Only if the previous step
+		// did not make GARO cut at all, go one further; while GARO is still
+		// cutting (e.g. a pilot above what a self-limited car draws), going
+		// further would put the phase 2 A over and GARO would slam to 6 A.
+		// A GARO that needed a second step to cut at all gets one amp more
+		// from then on (learned per session, at most one).
+		if lastWasLower && in.PilotA >= m.pilotAtLower {
+			m.lowerExtraA = 1
+		}
+		dlm := int(math.Round(busiestA)) - 1 - m.lowerExtraA
+		if lastWasLower && in.PilotA >= m.pilotAtLower {
+			dlm = min(dlm, in.DLMA-1)
+		}
+		if lastWasLower && dlm >= in.DLMA {
+			return hold("waiting for GARO to finish the previous cut")
+		}
 		m.lastLower = in.Now
+		m.lastOwnCut = in.Now
 		m.pilotAtLower = in.PilotA
 		return write(dlm,
 			fmt.Sprintf("lower pilot %d A by one step (wanted %.1f A)", in.PilotA, want))
@@ -429,7 +497,23 @@ func (m *dlmModel) step(in modelInput) modelOutput {
 			m.raiseRoomTicks = 0
 			return write(position, "move DLM down to the hold position (stop an unwanted GARO raise)")
 		default:
+			if in.PilotA <= in.MinA && want <= float64(in.MinA) {
+				return hold("at the 6 A floor; the hard stop handles the rest")
+			}
 			return hold("on target")
 		}
+	}
+}
+
+// cutLandThresholdA: how far above the wanted level the car must be before
+// the model cuts and lands instead of lowering in 1 A steps.
+func cutLandThresholdA(reduction string) float64 {
+	switch reduction {
+	case "staircase":
+		return math.Inf(1)
+	case "cut":
+		return modelCutLandMinA
+	default:
+		return modelCutLandAutoA
 	}
 }

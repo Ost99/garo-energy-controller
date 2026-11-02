@@ -331,6 +331,13 @@ const settingsPage = `<!doctype html>
                     <option value="model">Model, one car only (under test)</option>
                 </select>
 
+                <label for="modelReduction">Model: large reductions</label>
+                <select id="modelReduction">
+                    <option value="auto">1 A steps up to 6 A, cut and land above (default)</option>
+                    <option value="staircase">Always 1 A steps (no cut to 6 A)</option>
+                    <option value="cut">Cut and land from 5 A</option>
+                </select>
+
 
                 <label for="downDeadband">Downward deadband</label>
                 <div><input id="downDeadband" type="number" min="0" step="50"> W</div>
@@ -446,6 +453,7 @@ async function loadConfiguration() {
         document.getElementById("downDeadband").value = t.down_deadband_w;
         document.getElementById("urgentDown").value = t.urgent_down_w;
         document.getElementById("controlStrategy").value = t.control_strategy;
+        document.getElementById("modelReduction").value = t.model_reduction || "auto";
         document.getElementById("onePhaseGate").value = t.one_phase_up_gate_w;
         document.getElementById("onePhaseTwoAmp").value = t.one_phase_two_amp_threshold_w;
         document.getElementById("onePhaseCalculated").value = t.one_phase_calculated_threshold_w;
@@ -490,6 +498,7 @@ async function saveConfig() {
             down_deadband_w: Number(document.getElementById("downDeadband").value),
             urgent_down_w: Number(document.getElementById("urgentDown").value),
             control_strategy: document.getElementById("controlStrategy").value,
+            model_reduction: document.getElementById("modelReduction").value,
             one_phase_up_gate_w: Number(document.getElementById("onePhaseGate").value),
             one_phase_two_amp_threshold_w: Number(document.getElementById("onePhaseTwoAmp").value),
             one_phase_calculated_threshold_w: Number(document.getElementById("onePhaseCalculated").value),

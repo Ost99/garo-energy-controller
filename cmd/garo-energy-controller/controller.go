@@ -39,6 +39,11 @@ const (
 	// for the hard stop's household estimate.
 	hardStopVoltsPerPhase = 230.0
 
+	// hardStopHouseholdTicks: consecutive ticks (~30 s each) the household
+	// condition must hold before a hard stop. It fires minutes before a
+	// breach, so this costs little margin; the lead-time check stops at once.
+	hardStopHouseholdTicks = 2
+
 	// noIncreaseFinalSeconds: no upward DLM changes this close to the end of
 	// the hour. Increases this late spend the slack faster than the slow
 	// downward path can correct, and only feed the hard stop.
@@ -257,8 +262,9 @@ type EnergyController struct {
 	model dlmModel
 
 	// Household power average for the hard stop (all strategies).
-	householdAvgW  float64
-	householdAvgAt time.Time
+	householdAvgW      float64
+	householdAvgAt     time.Time
+	householdStopTicks int
 
 	// garoSettings applies the configured GARO settings (startup mode,
 	// CENTRAL101) once GARO is ready. See garo_settings.go.
@@ -722,35 +728,43 @@ func (c *EnergyController) releaseHardStop() error {
 }
 
 func hardStopRequired(s ControllerSnapshot) bool {
+	return hardStopHouseholdRequired(s) || hardStopLeadTimeRequired(s)
+}
+
+// hardStopHouseholdRequired: the household cannot be stopped, the car can.
+// Stop when what is left of the budget only just covers the household for
+// the rest of the hour plus the car until the stop takes effect; after that
+// the car stays off until the next hour. The tick requires this on
+// consecutive ticks (hardStopHouseholdTicks) before stopping.
+func hardStopHouseholdRequired(s ControllerSnapshot) bool {
 	if !s.EnergyValid || !s.Charging {
 		return false
 	}
+	carW := garoCarW(s)
+	if carW <= 0 {
+		return false
+	}
+	rest := float64(s.SecondsRemaining)
+	lead := math.Min(hardStopLeadTime.Seconds(), rest)
+	// Averaged household power, so a single burst does not stop the car
+	// for the rest of the hour; the lead-time check still catches a
+	// sustained new load at the last moment.
+	householdW := s.HouseholdAvgW
+	if householdW <= 0 {
+		householdW = householdEstimateW(s)
+	}
+	neededKWh := householdW/1000.0*rest/3600.0 + carW/1000.0*lead/3600.0
+	return neededKWh-s.RemainingEnergyKWh > hardStopOvershootToleranceKWh
+}
 
+// hardStopLeadTimeRequired: the limit is reached within the stop latency at
+// the current grid power, and the hour does not end first.
+func hardStopLeadTimeRequired(s ControllerSnapshot) bool {
+	if !s.EnergyValid || !s.Charging {
+		return false
+	}
 	if s.RemainingEnergyKWh <= 0 {
 		return true
-	}
-
-	// The household cannot be stopped, the car can. Stop when what is left
-	// of the budget only just covers the household for the rest of the hour
-	// plus the car until the stop takes effect; after that the car stays off
-	// until the next hour.
-	carW := (s.Central101Phase1A + s.Central101Phase2A + s.Central101Phase3A) *
-		hardStopVoltsPerPhase
-	if carW > 0 {
-		rest := float64(s.SecondsRemaining)
-		lead := math.Min(hardStopLeadTime.Seconds(), rest)
-		// Averaged household power, so a single burst does not stop the car
-		// for the rest of the hour; the lead-time check below still catches
-		// a sustained new load.
-		householdW := s.HouseholdAvgW
-		if householdW <= 0 {
-			householdW = s.GridPowerW - carW
-		}
-		householdKW := math.Max(householdW, 0) / 1000.0
-		neededKWh := householdKW*rest/3600.0 + carW/1000.0*lead/3600.0
-		if neededKWh-s.RemainingEnergyKWh > hardStopOvershootToleranceKWh {
-			return true
-		}
 	}
 
 	powerKW := math.Max(s.GridPowerW, 0) / 1000.0
@@ -769,6 +783,26 @@ func hardStopRequired(s ControllerSnapshot) bool {
 	projectedOvershootKWh :=
 		powerKW*float64(s.SecondsRemaining)/3600.0 - s.RemainingEnergyKWh
 	return projectedOvershootKWh > hardStopOvershootToleranceKWh
+}
+
+// garoCarW is the chargers' power from CENTRAL101.
+func garoCarW(s ControllerSnapshot) float64 {
+	return (s.Central101Phase1A + s.Central101Phase2A + s.Central101Phase3A) *
+		hardStopVoltsPerPhase
+}
+
+// garoHouseholdW is household power from GARO's own meters: CENTRAL100
+// (site) minus CENTRAL101 (chargers) per phase. Both come from the same
+// poll, unlike Tibber's grid power, which runs ahead of CENTRAL101 while
+// a car ramps and would count part of the car as household.
+func garoHouseholdW(s ControllerSnapshot) float64 {
+	site := [3]float64{s.Central100Phase1A, s.Central100Phase2A, s.Central100Phase3A}
+	car := [3]float64{s.Central101Phase1A, s.Central101Phase2A, s.Central101Phase3A}
+	householdA := 0.0
+	for p := range site {
+		householdA += math.Max(site[p]-car[p], 0)
+	}
+	return householdA * hardStopVoltsPerPhase
 }
 
 // hardStopSecondsToLimit is the projected time until the hourly limit at the
@@ -1166,26 +1200,37 @@ func (c *EnergyController) tick() {
 	// ALWAYS_OFF remains effective even when one charger is not participating
 	// in DLM, so evaluate this before suspending DLM regulation.
 	s.HouseholdAvgW = c.householdAverage(now, s)
-	if hardStopRequired(s) {
+	if hardStopHouseholdRequired(s) {
+		c.householdStopTicks++
+	} else {
+		c.householdStopTicks = 0
+	}
+	householdStop := c.householdStopTicks >= hardStopHouseholdTicks
+	if householdStop || hardStopLeadTimeRequired(s) {
+		reason := "limit within the stop latency"
+		if householdStop {
+			reason = "household needs the rest of the budget"
+		}
 		log.Printf(
-			"hard stop: hour energy %.3f kWh, remaining %.3f kWh, grid %.0f W, "+
-				"limit in %.0f s, hour ends in %d s",
+			"hard stop (%s): hour energy %.3f kWh, remaining %.3f kWh, grid %.0f W, "+
+				"household avg %.0f W, car %.0f W, limit in %.0f s, hour ends in %d s",
+			reason,
 			s.HourEnergyKWh,
 			s.RemainingEnergyKWh,
 			s.GridPowerW,
+			s.HouseholdAvgW,
+			garoCarW(s),
 			hardStopSecondsToLimit(s),
 			s.SecondsRemaining,
 		)
+		c.householdStopTicks = 0
 		c.model.reset()
 		if err := c.activateHardStop(hourStart(referenceTime)); err != nil {
 			s.Error = err.Error()
 			s.Decision = "hard stop failed"
 		} else {
 			s.State = "hard-stop"
-			s.Decision = fmt.Sprintf(
-				"hard stop: hourly target predicted within %d seconds",
-				int(hardStopLeadTime.Seconds()),
-			)
+			s.Decision = "hard stop: " + reason + "; off until the next hour"
 		}
 
 		c.setSnapshot(s)
@@ -1575,6 +1620,7 @@ func (c *EnergyController) modelDecision(
 		MaxPilotA:        car.MaxPilotA,
 		TargetW:          s.EffectiveTargetPowerW,
 		BudgetCeilingW:   s.HardBudgetCeilingW,
+		Reduction:        cfg.ControlTuning.ModelReduction,
 		DLMA:             currentLimit,
 		SinceWrite:       adjustmentAge,
 		MinA:             cfg.MinimumCurrentA,
@@ -1630,12 +1676,29 @@ func modelSingleCar(s ControllerSnapshot) (GaroPilotLevel, [3]bool, string) {
 	return car, phases, ""
 }
 
+// householdEstimateW is household power for the hard stop. With Tibber
+// available it is Tibber's grid power minus the chargers (real power), but
+// never more than GARO's own meters show: while a car ramps, Tibber runs
+// ahead of CENTRAL101 and would count part of the car as household. Without
+// Tibber (the energy source has fallen back to CENTRAL100), GARO's meters
+// alone are used.
+func householdEstimateW(s ControllerSnapshot) float64 {
+	garoW := garoHouseholdW(s)
+	if s.Source != "tibber" {
+		return garoW
+	}
+	tibberW := math.Max(s.GridPowerW-garoCarW(s), 0)
+	if garoW <= 0 {
+		return tibberW // CENTRAL100 not available
+	}
+	return math.Min(tibberW, garoW)
+}
+
 // householdAverage updates and returns an exponential average of household
-// power (grid minus car) for the hard stop's estimate of the rest of the hour.
+// power (householdEstimateW) for the hard stop's estimate of the rest of the
+// hour.
 func (c *EnergyController) householdAverage(now time.Time, s ControllerSnapshot) float64 {
-	carW := (s.Central101Phase1A + s.Central101Phase2A + s.Central101Phase3A) *
-		hardStopVoltsPerPhase
-	householdW := math.Max(s.GridPowerW-carW, 0)
+	householdW := householdEstimateW(s)
 	dt := now.Sub(c.householdAvgAt).Seconds()
 	if c.householdAvgAt.IsZero() || dt <= 0 || dt > modelResetGap.Seconds() {
 		c.householdAvgW = householdW

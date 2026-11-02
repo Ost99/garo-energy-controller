@@ -146,6 +146,7 @@ func TestHardStopWhenHouseholdUsesTheRestOfTheBudget(t *testing.T) {
 	s := ControllerSnapshot{
 		Charging: true, EnergyValid: true,
 		RemainingEnergyKWh: 1.2, GridPowerW: 6840, SecondsRemaining: 1500,
+		Central100Phase1A: 10, Central100Phase2A: 10, Central100Phase3A: 9.7,
 		Central101Phase1A: 6, Central101Phase2A: 6, Central101Phase3A: 6,
 	}
 	if !hardStopRequired(s) {
@@ -156,5 +157,49 @@ func TestHardStopWhenHouseholdUsesTheRestOfTheBudget(t *testing.T) {
 	s.RemainingEnergyKWh = 1.6
 	if hardStopRequired(s) {
 		t.Fatal("hard stop issued although household and the car's stop latency fit")
+	}
+}
+
+func TestHardStopHouseholdFromGaroMeters(t *testing.T) {
+	// A car ramping up: Tibber's grid power already includes most of the
+	// ramp, CENTRAL101 (and CENTRAL100) still show the car at 6 A. Grid
+	// minus car would count ~6.6 kW of car as household and stop the car
+	// for the rest of the hour; GARO's own meters do not.
+	s := ControllerSnapshot{
+		Charging: true, EnergyValid: true, Source: "tibber",
+		RemainingEnergyKWh: 5.0, GridPowerW: 13000, SecondsRemaining: 2400,
+		Central100Phase1A: 8, Central100Phase2A: 7, Central100Phase3A: 7.5,
+		Central101Phase1A: 6, Central101Phase2A: 6, Central101Phase3A: 6,
+	}
+	if hardStopHouseholdRequired(s) {
+		t.Fatalf("household estimate %.0f W stopped the car", garoHouseholdW(s))
+	}
+}
+
+func TestHouseholdEstimateSources(t *testing.T) {
+	base := ControllerSnapshot{
+		GridPowerW:        6000,
+		Central100Phase1A: 12, Central100Phase2A: 10, Central100Phase3A: 9,
+		Central101Phase1A: 6, Central101Phase2A: 6, Central101Phase3A: 6,
+	}
+	carW := 18 * hardStopVoltsPerPhase
+	garoW := 13 * hardStopVoltsPerPhase
+
+	tibber := base
+	tibber.Source = "tibber"
+	if got := householdEstimateW(tibber); got != 6000-carW {
+		t.Errorf("Tibber available: %.0f W, want Tibber minus chargers %.0f W", got, 6000-carW)
+	}
+
+	ramping := tibber
+	ramping.GridPowerW = 13000 // Tibber ahead of CENTRAL101 while the car ramps
+	if got := householdEstimateW(ramping); got != garoW {
+		t.Errorf("Tibber ahead of GARO: %.0f W, want GARO's %.0f W", got, garoW)
+	}
+
+	fallback := base
+	fallback.Source = "central100"
+	if got := householdEstimateW(fallback); got != garoW {
+		t.Errorf("Tibber unavailable: %.0f W, want GARO's %.0f W", got, garoW)
 	}
 }

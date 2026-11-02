@@ -73,6 +73,11 @@ type simScenario struct {
 	household   func(sec float64) [3]float64
 	startSecond float64 // car plugged in this far into the hour
 	limitKWh    float64 // hourly limit; 0 = the default configuration
+
+	// Optional: the hourly limit changes to limitAfterKWh at changeAtSecond.
+	changeAtSecond float64
+	limitAfterKWh  float64
+	reduction      string // ModelReduction; "" = default
 }
 
 type simResult struct {
@@ -81,6 +86,7 @@ type simResult struct {
 	writeReasons  []string
 	garoSlams     int // GARO cuts straight to the minimum
 	hardStops     int
+	followSeconds float64 // after a limit change: until the car is near the wanted level
 	peakGridW     float64 // after the first 10 minutes of charging
 	minGridW      float64
 	oscillating   bool
@@ -112,6 +118,10 @@ func simulateModelHour(t *testing.T, sc simScenario, v plantVariant) simResult {
 	if sc.limitKWh > 0 {
 		cfg.HourlyLimitKWh = sc.limitKWh
 	}
+	if sc.reduction != "" {
+		cfg.ControlTuning.ModelReduction = sc.reduction
+	}
+
 	const volts = 230.0 // the controller assumes 240 W per phase amp
 	const dt = 5.0
 
@@ -124,7 +134,7 @@ func simulateModelHour(t *testing.T, sc simScenario, v plantVariant) simResult {
 	var m dlmModel
 	start := time.Date(2026, 10, 30, 23, 0, 0, 0, time.Local)
 	lastWrite := start.Add(-time.Hour)
-	res := simResult{minGridW: math.Inf(1)}
+	res := simResult{minGridW: math.Inf(1), followSeconds: -1}
 
 	energy := 0.0
 	for sec := 0.0; sec < 3600; sec += dt {
@@ -154,6 +164,9 @@ func simulateModelHour(t *testing.T, sc simScenario, v plantVariant) simResult {
 			continue
 		}
 		now := start.Add(time.Duration(sec) * time.Second)
+		if sc.limitAfterKWh > 0 && sec >= sc.changeAtSecond {
+			cfg.HourlyLimitKWh = sc.limitAfterKWh
+		}
 		var s ControllerSnapshot
 		populateEnergyDiagnostics(&s, cfg, "sim", energy, gridW, now, true)
 		s.Charging = true
@@ -165,6 +178,8 @@ func simulateModelHour(t *testing.T, sc simScenario, v plantVariant) simResult {
 		}
 		s.Central101Phase1A, s.Central101Phase2A, s.Central101Phase3A =
 			carPhaseA[0], carPhaseA[1], carPhaseA[2]
+		s.Central100Phase1A, s.Central100Phase2A, s.Central100Phase3A =
+			site[0], site[1], site[2]
 		s.HouseholdAvgW = m.householdAvgW
 		if !g.stopped && hardStopRequired(s) {
 			// The controller's hard stop: charging off for the rest of the
@@ -186,7 +201,12 @@ func simulateModelHour(t *testing.T, sc simScenario, v plantVariant) simResult {
 			SinceWrite: now.Sub(lastWrite),
 			MinA:       cfg.MinimumCurrentA, MaxA: cfg.MaximumCurrentA,
 			WattsPerPhaseAmp: cfg.ControlTuning.OnePhaseWattsPerAmp,
+			Reduction:        cfg.ControlTuning.ModelReduction,
 		})
+		if sc.limitAfterKWh > 0 && sec >= sc.changeAtSecond && res.followSeconds < 0 &&
+			sec > sc.changeAtSecond && g.carA <= out.WantPilotA+modelStepDeadbandA {
+			res.followSeconds = sec - sc.changeAtSecond
+		}
 		res.oscillating = res.oscillating || out.Oscillating
 		if out.DLMA != g.dlm {
 			g.dlm = out.DLMA
@@ -477,7 +497,7 @@ func TestModelOtherHourlyLimits(t *testing.T) {
 				// A budget hovering around the car's maximum with a cycling
 				// element switches between burst room and limiting the car;
 				// those writes are RAM-only 1 A steps, so allow more of them.
-				checkHourLimit(t, name, r, limit, 0, 16)
+				checkHourLimit(t, name, r, limit, 0, 20)
 				// GARO cuts are only avoidable when the budget covers the car
 				// at its maximum, the household and the element together.
 				phases := map[bool]float64{true: 3, false: 1}[car.phases[0]]
@@ -485,6 +505,41 @@ func TestModelOtherHourlyLimits(t *testing.T) {
 				needKW := (car.carMaxA*phases + 7 + 12*burstPhases) * 230 / 1000
 				if limit-0.1 > needKW && r.garoSlams > 2 {
 					t.Errorf("%s: budget covers car and element but GARO slammed the car %d times", name, r.garoSlams)
+				}
+			}
+		}
+	}
+}
+
+func TestModelLargeReductionModes(t *testing.T) {
+	// Seen 2026-11-01: the limit was lowered while a 1-phase car charged at
+	// its maximum; wanted fell by ~16 A and 1 A steps every 90 s took 15
+	// minutes. Now: faster staircase, and cut and land for large reductions
+	// (default "auto"), each selectable.
+	for _, mode := range []string{"staircase", "auto", "cut"} {
+		for _, v := range plantVariants {
+			name := mode + "/" + v.name
+			r := simulateModelHour(t, simScenario{
+				carPhases: onePhaseL2, carMaxA: 28,
+				household:      steadyHousehold([3]float64{4.3, 0.5, 2.2}),
+				changeAtSecond: 300, limitAfterKWh: 4.9, reduction: mode,
+			}, v)
+			t.Logf("%s: car near the wanted level after %.0f s, %d slams, %d writes",
+				name, r.followSeconds, r.garoSlams, r.writes)
+			checkHourLimit(t, name, r, 4.9, 0, 30)
+			switch mode {
+			case "staircase":
+				if r.followSeconds < 0 || r.followSeconds > 600 {
+					t.Errorf("%s: %.0f s to reach the wanted level, want ≤ 600", name, r.followSeconds)
+				}
+				// The plant variant with the tightest cut tolerance can turn
+				// one 1 A step into a slam.
+				if r.garoSlams > 1 {
+					t.Errorf("%s: staircase slammed the car %d times", name, r.garoSlams)
+				}
+			default:
+				if r.followSeconds < 0 || r.followSeconds > 240 {
+					t.Errorf("%s: %.0f s to reach the wanted level, want ≤ 240", name, r.followSeconds)
 				}
 			}
 		}

@@ -44,6 +44,13 @@ type ControlTuningConfig struct {
 	// step controller, default) or "model" (GARO band model, see
 	// controller_model.go; one car only, under test).
 	ControlStrategy string `json:"control_strategy"`
+
+	// ModelReduction selects how the model lowers the car when it is far
+	// above the wanted level: "auto" (default; 1 A steps for up to 6 A,
+	// cut and land above that), "staircase" (always 1 A steps), or "cut"
+	// (cut and land whenever GARO's cut can land it, from 5 A). Cut and land
+	// briefly drops the car to 6 A; some cars may stop charging on that.
+	ModelReduction string `json:"model_reduction"`
 }
 
 type Config struct {
@@ -101,6 +108,7 @@ func defaultControlTuning() ControlTuningConfig {
 		UnusedDLMHeadroomA: 1.0,
 
 		ControlStrategy: "incremental",
+		ModelReduction:  "auto",
 	}
 }
 
@@ -221,6 +229,11 @@ func (t ControlTuningConfig) Validate() error {
 	}
 	if t.ControlStrategy != "model" && t.ControlStrategy != "incremental" {
 		return fmt.Errorf("control_tuning.control_strategy must be \"model\" or \"incremental\"")
+	}
+	switch t.ModelReduction {
+	case "auto", "staircase", "cut":
+	default:
+		return fmt.Errorf("control_tuning.model_reduction must be \"auto\", \"staircase\" or \"cut\"")
 	}
 
 	return nil
